@@ -9,6 +9,7 @@ from PIL import Image
 
 from darktriage.config import load_config
 from darktriage.core.engine import AnalysisOptions, analyze_directory, chunked
+from darktriage.core.exif_reader import ImagePair
 
 
 def _sharp_pattern() -> np.ndarray:
@@ -61,3 +62,37 @@ def test_analyze_directory_parallel(tmp_path):
 
     assert len(assessments) == 3
     assert all(a.rating is not None for a in assessments)
+
+
+def test_analyze_uses_image_map_without_jpeg(tmp_path):
+    """An explicit image_map (e.g. an embedded preview) enables scoring a RAW
+    that has no matching JPG."""
+    (tmp_path / "A.NEF").write_bytes(b"RAW")
+    preview = tmp_path / "A_preview.jpg"
+    Image.fromarray(_sharp_pattern()).save(preview)
+
+    pairs = [
+        ImagePair(
+            raw_path=tmp_path / "A.NEF",
+            jpg_path=None,
+            capture_time=datetime(2024, 1, 1, 12, 0, 0),
+            metadata_loaded=True,
+            iso=None,
+            orientation=1,
+        )
+    ]
+    config = load_config(tmp_path / "missing.toml")
+    options = AnalysisOptions(max_dim=256, workers=1)
+
+    assessments = analyze_directory(
+        str(tmp_path),
+        config,
+        options,
+        pairs=pairs,
+        image_map={tmp_path / "A.NEF": preview},
+    )
+
+    assert len(assessments) == 1
+    assert assessments[0].jpg_path is None
+    assert assessments[0].rating is not None
+    assert assessments[0].sharpness is not None
