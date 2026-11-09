@@ -23,6 +23,8 @@ _TAG_DATETIME_ORIGINAL = 0x9003
 _TAG_SUBSEC_ORIGINAL = 0x9291
 _TAG_OFFSET_TIME_ORIGINAL = 0x9011
 _TAG_DATETIME = 0x0132
+_TAG_ISO = 0x8827
+_TAG_ORIENTATION = 0x0112
 
 # Default burst-detection window in seconds.
 DEFAULT_BURST_SECONDS = 2.0
@@ -30,6 +32,15 @@ DEFAULT_BURST_SECONDS = 2.0
 
 class ExifParsingError(RuntimeError):
     """Raised when an image carries no usable capture timestamp."""
+
+
+@dataclass(frozen=True)
+class ExifSummary:
+    """Capture time / ISO / orientation read from one JPEG in a single open."""
+
+    capture_time: Optional[datetime] = None
+    iso: Optional[int] = None
+    orientation: int = 1
 
 
 @dataclass
@@ -40,6 +51,9 @@ class ImagePair:
     jpg_path: Optional[Path]
     capture_time: Optional[datetime] = None
     sharpness: Optional[float] = None
+    iso: Optional[int] = None
+    orientation: int = 1
+    metadata_loaded: bool = False
 
 
 @dataclass
@@ -95,22 +109,61 @@ def decode_capture_time(value, subsec=None) -> Optional[datetime]:
     return base.replace(microsecond=_subsec_microseconds(subsec))
 
 
+def _coerce_iso(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return int(value[0]) if value else None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, bytes):
+        text = value.decode("ascii", "ignore").split(",")[0]
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_orientation(value) -> int:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else 1
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 1
+
+
+def read_exif_summary(jpg_path: Path) -> "ExifSummary":
+    """Read capture time, ISO and orientation from a JPEG in one file open.
+
+    Returns an empty summary for a missing/corrupt EXIF header instead of
+    raising, so a single bad file cannot abort a batch.
+    """
+    try:
+        with Image.open(jpg_path) as image:
+            exif = image.getexif()
+            dt = exif.get(_TAG_DATETIME_ORIGINAL) or exif.get(_TAG_DATETIME)
+            subsec = exif.get(_TAG_SUBSEC_ORIGINAL)
+            iso = _coerce_iso(exif.get(_TAG_ISO))
+            orientation = _coerce_orientation(exif.get(_TAG_ORIENTATION, 1))
+    except Exception as exc:  # noqa: BLE001 - corrupt header -> empty summary
+        logger.warning("Cannot read EXIF from %s: %s", jpg_path, exc)
+        return ExifSummary()
+    return ExifSummary(
+        capture_time=decode_capture_time(dt, subsec),
+        iso=iso,
+        orientation=orientation,
+    )
+
+
 def read_capture_time(jpg_path: Path) -> Optional[datetime]:
     """Read DateTimeOriginal + sub-second from a JPEG preview.
 
     Returns None for a missing/corrupt EXIF header (the caller decides how
     to handle the pair) instead of raising.
     """
-    try:
-        with Image.open(jpg_path) as image:
-            exif = image.getexif()
-    except Exception as exc:  # noqa: BLE001 - corrupt header -> None
-        logger.warning("Cannot read EXIF from %s: %s", jpg_path, exc)
-        return None
-
-    dt = exif.get(_TAG_DATETIME_ORIGINAL) or exif.get(_TAG_DATETIME)
-    subsec = exif.get(_TAG_SUBSEC_ORIGINAL)
-    return decode_capture_time(dt, subsec)
+    return read_exif_summary(jpg_path).capture_time
 
 
 def _is_macos_metadata(path: Path) -> bool:
@@ -156,11 +209,20 @@ def discover_pairs(target_dir: Path) -> List[ImagePair]:
             logger.warning(
                 "No matching JPEG preview for %s (skipped for scoring)", raw
             )
+            pairs.append(ImagePair(raw_path=raw, jpg_path=None))
+            continue
+
+        # One EXIF open per file: capture time, ISO and orientation are read
+        # together and cached on the pair so the engine never re-opens it.
+        summary = read_exif_summary(jpg)
         pairs.append(
             ImagePair(
                 raw_path=raw,
                 jpg_path=jpg,
-                capture_time=read_capture_time(jpg) if jpg else None,
+                capture_time=summary.capture_time,
+                iso=summary.iso,
+                orientation=summary.orientation,
+                metadata_loaded=True,
             )
         )
     return pairs

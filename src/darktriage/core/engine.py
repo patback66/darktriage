@@ -79,8 +79,13 @@ def _score_payload(payload: Payload) -> Score:
 
 
 def _build_payload(pair: ImagePair, options: AnalysisOptions) -> Payload:
-    meta = load_image_metadata(pair.jpg_path)
-    return (str(pair.jpg_path), meta.iso, meta.orientation, options)
+    """Assemble a worker payload, reusing cached EXIF when available."""
+    if pair.metadata_loaded:
+        iso, orientation = pair.iso, pair.orientation
+    else:
+        meta = load_image_metadata(pair.jpg_path)
+        iso, orientation = meta.iso, meta.orientation
+    return (str(pair.jpg_path), iso, orientation, options)
 
 
 def score_pairs(
