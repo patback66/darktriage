@@ -10,11 +10,16 @@ from PIL import Image
 
 from darktriage.core.metrics import (
     ExposureReport,
+    ImageMetadata,
     Score,
+    apply_noise_filter,
+    apply_orientation,
+    apply_region_mask,
     check_exposure,
     compute_composition_score,
     compute_ev_offset,
     compute_tenengrad,
+    load_image_metadata,
     prepare_proxy,
     score_image,
     score_images,
@@ -90,7 +95,55 @@ def test_score_images_parallel(tmp_path):
         Image.fromarray(_sharp_pattern()).save(path)
         paths.append(path)
 
-    scores = score_images(paths, max_dim=256, workers=2)
+    scores = score_images([(p, None, 1) for p in paths], max_dim=256, workers=2)
     assert len(scores) == 2
     assert all(isinstance(s, Score) for s in scores)
     assert all(s.sharpness > 0.0 for s in scores)
+
+
+def test_load_image_metadata_reads_iso_and_orientation(tmp_path):
+    path = tmp_path / "meta.jpg"
+    image = Image.new("RGB", (32, 32), "gray")
+    exif = Image.Exif()
+    exif[0x8827] = 3200  # ISOSpeedRatings
+    exif[0x0112] = 6      # orientation = rotate 90 CW
+    image.save(path, exif=exif)
+
+    meta = load_image_metadata(path)
+    assert isinstance(meta, ImageMetadata)
+    assert meta.iso == 3200
+    assert meta.orientation == 6
+
+
+def test_load_image_metadata_defaults_when_no_exif(tmp_path):
+    path = tmp_path / "plain.jpg"
+    Image.new("RGB", (16, 16), "gray").save(path)
+    meta = load_image_metadata(path)
+    assert meta.iso is None
+    assert meta.orientation == 1
+
+
+def test_apply_noise_filter_blurs_only_high_iso():
+    rng = np.random.default_rng(0)
+    arr = rng.integers(0, 256, (64, 64), dtype=np.uint8)
+    low = apply_noise_filter(arr, iso=200, iso_threshold=1600)
+    high = apply_noise_filter(arr, iso=3200, iso_threshold=1600)
+    assert np.array_equal(low, arr)  # no blur below threshold
+    assert not np.array_equal(high, arr)  # blur applied above threshold
+
+
+def test_apply_orientation_rotates_interchanges_shape():
+    arr = np.zeros((10, 20), dtype=np.uint8)
+    assert apply_orientation(arr, 6).shape == (20, 10)  # 90 CW swaps dims
+    assert apply_orientation(arr, 3).shape == (10, 20)  # 180 keeps dims
+    assert apply_orientation(arr, 1).shape == (10, 20)
+
+
+def test_apply_region_mask_weights_center():
+    arr = np.full((65, 65), 200, dtype=np.uint8)
+    weighted = apply_region_mask(arr, fraction=0.6)
+    assert weighted.shape == arr.shape
+    assert weighted.dtype == np.float64
+    # centre keeps full weight; far corners are suppressed
+    assert weighted[32, 32] == pytest.approx(200.0)
+    assert weighted[0, 0] < weighted[32, 32]

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -65,6 +65,18 @@ class Thresholds:
 
 
 @dataclass(frozen=True)
+class Sensor:
+    """Camera/processing behaviour (configurable, no camera-specific hardcoding)."""
+
+    # Gaussian-blur noise suppression applied when the EXIF ISO rating exceeds
+    # this value (Nikon D800E and similar high-ISO bodies benefit).
+    iso_blur_above: int = 1600
+    # Central percentage of the frame used to weight focus/composition
+    # calculations, avoiding lens-edge falloff.
+    region_center_fraction: float = 0.6
+
+
+@dataclass(frozen=True)
 class Tags:
     blur: str = "red"
     keeper: str = "green"
@@ -84,6 +96,7 @@ class Config:
     thresholds: Thresholds
     tags: Tags
     darktable: Darktable
+    sensor: Sensor = field(default_factory=Sensor)
     config_path: Optional[Path] = None
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from rich.console import Console
 from rich.table import Table
@@ -130,7 +130,14 @@ def _analyze_directory(
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
     workers: Optional[int] = None,
 ) -> List[Assessment]:
-    """Score every .NEF/.JPG pair in parallel and return assessments."""
+    """Score every .NEF/.JPG pair and return per-file assessments.
+
+    ISO and orientation metadata is read per preview and passed through the
+    scoring pipeline (noise filtering, auto-rotation, central-region masking)
+    so results are camera-configurable rather than hardcoded.
+    """
+    from darktriage.core.metrics import load_image_metadata, score_image
+
     pairs = discover_pairs(directory)
     gap = (
         threshold_seconds
@@ -139,25 +146,35 @@ def _analyze_directory(
     )
     groups = detect_bursts(pairs, threshold_seconds=gap)
 
-    # Parallel computer-vision scoring of all previews at once.
-    jpg_pairs = [pair for pair in pairs if pair.jpg_path is not None]
-    scores = score_images(
-        [pair.jpg_path for pair in jpg_pairs], max_dim=max_dim, workers=workers
-    )
-    score_by_jpg = {
-        pair.jpg_path: score for pair, score in zip(jpg_pairs, scores)
-    }
-
-    # Seed sharpness so select_burst_winners reuses the parallel result.
+    # Build per-file metadata and parallel-score every preview.
+    jpg_pairs = [p for p in pairs if p.jpg_path is not None]
+    items = []
     for pair in jpg_pairs:
-        pair.sharpness = score_by_jpg[pair.jpg_path].sharpness
-    select_burst_winners(groups)
+        meta = load_image_metadata(pair.jpg_path)
+        items.append((pair.jpg_path, meta.iso, meta.orientation))
+    scores = score_images(
+        items,
+        max_dim=max_dim,
+        center_fraction=config.sensor.region_center_fraction,
+        workers=workers,
+    )
+    score_by_path = {p.jpg_path: s for p, s in zip(jpg_pairs, scores)}
 
-    burst_index_of = {}
+    # The sharpest frame in each burst is the burst winner (+1 star).
+    winner_by_path: Dict[Path, bool] = {}
     for group in groups:
+        best = max(
+            group.images,
+            key=lambda r: score_by_path[r.jpg_path].sharpness,
+            default=None,
+        )
+        if best is not None:
+            winner_by_path[best.jpg_path] = True
+
+    burst_index_by_path: Dict[Path, int] = {}
+    for gi, group in enumerate(groups):
         for pair in group.images:
-            burst_index_of[id(pair)] = group.index
-    winner_ids = {id(group.winner) for group in groups if group.winner}
+            burst_index_by_path[pair.raw_path] = gi
 
     assessments: List[Assessment] = []
     for pair in pairs:
@@ -165,8 +182,8 @@ def _analyze_directory(
             raw_path=pair.raw_path,
             jpg_path=pair.jpg_path,
             capture_time=pair.capture_time,
-            burst_index=burst_index_of.get(id(pair)),
-            is_burst_winner=id(pair) in winner_ids,
+            burst_index=burst_index_by_path.get(pair.raw_path),
+            is_burst_winner=pair.jpg_path in winner_by_path,
         )
 
         if pair.jpg_path is None:
@@ -174,7 +191,7 @@ def _analyze_directory(
             assessments.append(assessment)
             continue
 
-        score = score_by_jpg[pair.jpg_path]
+        score = score_by_path[pair.jpg_path]
         if score.error:
             assessment.error = score.error
             assessments.append(assessment)

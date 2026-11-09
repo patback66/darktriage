@@ -3,6 +3,9 @@
 Deterministic, order-independent scoring.  Camera JPEG previews are downscaled
 in memory (Lanczos) to a long edge of 1920 px before metrics are computed.
 Scoring can be parallelised across a process pool via score_images().
+
+Sensor metadata (ISO, EXIF orientation) is read from the preview and used to
+make the scoring deterministic and camera-agnostic.
 """
 
 from __future__ import annotations
@@ -49,6 +52,46 @@ class Score:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ImageMetadata:
+    """Camera/proxy metadata read from the JPEG preview."""
+
+    iso: Optional[int] = None
+    orientation: int = 1  # 1 = normal; 2-8 = EXIF orientation tags
+
+
+def load_image_metadata(jpg_path: Union[str, Path]) -> ImageMetadata:
+    """Read ISO and EXIF orientation from a JPEG preview."""
+    with Image.open(jpg_path) as image:
+        image.load()
+        exif = image.getexif()
+        iso = None
+        iso_value = exif.get(0x8827)  # ISOSpeedRatings
+        if iso_value is not None:
+            if isinstance(iso_value, (list, tuple)):
+                iso = int(iso_value[0]) if iso_value else None
+            elif isinstance(iso_value, int):
+                iso = int(iso_value)
+            elif isinstance(iso_value, bytes):
+                iso = int(str(iso_value.decode("ascii", "ignore").split(",")[0]))
+        orientation = exif.get(0x0112, 1)
+        if isinstance(orientation, (tuple, list)):
+            orientation = int(orientation[0]) if orientation else 1
+        return ImageMetadata(iso=iso, orientation=int(orientation))
+
+
+def to_grayscale(image: np.ndarray) -> np.ndarray:
+    """Convert a numpy image array to a single-channel uint8 array."""
+    if image.ndim == 2:
+        return image.astype(np.uint8)
+    if image.ndim == 3:
+        if image.shape[2] == 3:
+            return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        if image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+    raise ValueError(f"Unsupported image shape: {image.shape}")
+
+
 def prepare_proxy(
     jpg_path: Union[str, Path], max_dim: int = DEFAULT_PROXY_MAX_DIM
 ) -> np.ndarray:
@@ -57,7 +100,7 @@ def prepare_proxy(
     Returns a single-channel uint8 grayscale matrix.  Resizing uses Lanczos.
     """
     with Image.open(jpg_path) as image:
-        image = image.convert("L")
+        image = image.convert("RGB")
         width, height = image.size
         long_edge = max(width, height)
         if long_edge > max_dim:
@@ -67,7 +110,7 @@ def prepare_proxy(
                 max(1, int(round(height * scale))),
             )
             image = image.resize(new_size, Image.LANCZOS)
-        return np.asarray(image, dtype=np.uint8)
+        return to_grayscale(np.asarray(image))
 
 
 def compute_tenengrad(gray_img: np.ndarray) -> float:
@@ -116,14 +159,140 @@ def check_exposure(gray_img: np.ndarray) -> ExposureReport:
         return ExposureReport(mean_luminance=0.0, clipped_highlight_pct=0.0)
     mean_luminance = float(gray_img.mean())
     clipped_pixels = int(np.count_nonzero(gray_img > HIGHLIGHT_LUMINANCE))
-    clipped_highlight_pct = float(clipped_pixels) / float(gray_img.size) * 100.0
+    clipped_highlight_pct = (
+        float(clipped_pixels) / float(gray_img.size) * 100.0
+    )
     return ExposureReport(
         mean_luminance=mean_luminance,
         clipped_highlight_pct=clipped_highlight_pct,
     )
 
+
+def apply_orientation(gray: np.ndarray, orientation: int = 1) -> np.ndarray:
+    """Apply an EXIF Orientation tag (1-8) to a grayscale matrix."""
+    if orientation not in range(1, 9):
+        return gray
+    if orientation == 2:      # mirror horizontal
+        return cv2.flip(gray, 1)
+    if orientation == 3:      # rotate 180
+        return cv2.rotate(gray, cv2.ROTATE_180)
+    if orientation == 4:      # mirror vertical
+        return cv2.flip(gray, 0)
+    # 5-8 involve mirror + rotation, expressed with cv2/numpy ops
+    if orientation == 5:      # mirror horizontal + rotate 270 CW
+        return np.rot90(cv2.flip(gray, 1))
+    if orientation == 6:      # rotate 90 CW
+        return cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+    if orientation == 7:      # mirror vertical and rotate 90 CW
+        return np.rot90(cv2.flip(gray, 0))
+    if orientation == 8:      # rotate 270 CW
+        return cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return gray
+
+
+def apply_noise_filter(gray: np.ndarray, iso: Optional[int] = None,
+                       iso_threshold: int = 1600) -> np.ndarray:
+    """Apply a Gaussian blur if the ISO rating is above the threshold."""
+    if iso is None or iso <= iso_threshold:
+        return gray
+    return cv2.GaussianBlur(gray, (3, 3), 0)
+
+
+def apply_region_mask(gray: np.ndarray, fraction: float = 0.6) -> np.ndarray:
+    """Return a central-weighted copy of the image.
+
+    A smooth mask (1.0 at the centre, 0.0 at the central-``fraction`` window
+    boundary) down-weights lens-edge falloff so the focus/composition scores
+    are driven by the sharpest central region.
+    """
+    h, w = gray.shape
+    cx = (w - 1) / 2.0
+    cy = (h - 1) / 2.0
+    half_w = (w * fraction) / 2.0
+    half_h = (h * fraction) / 2.0
+
+    xx = np.arange(w, dtype=np.float64)
+    yy = np.arange(h, dtype=np.float64)
+    dx = np.clip(np.abs(xx - cx) / half_w, 0.0, 1.0)
+    dy = np.clip(np.abs(yy - cy) / half_h, 0.0, 1.0)
+    dist = np.sqrt(dx[None, :] ** 2 + dy[:, None] ** 2) / np.sqrt(2.0)
+    weight = np.clip(1.0 - dist, 0.0, 1.0)
+    return gray.astype(np.float64) * weight
+
+
+def score_image(
+    jpg_path: Union[str, Path],
+    *,
+    max_dim: int = DEFAULT_PROXY_MAX_DIM,
+    iso: Optional[int] = None,
+    orientation: int = 1,
+    center_fraction: float = 0.6,
+    iso_threshold: int = 1600,
+) -> Score:
+    """Score one JPEG through orientation correction, noise filtering and
+    central-region weighting.
+
+    Calling this directly gives full per-camera, per-file control.
+    """
+    gray = prepare_proxy(jpg_path, max_dim=max_dim)
+    gray = apply_orientation(gray, orientation)
+    exposure = check_exposure(gray)
+    if iso is not None and iso > iso_threshold:
+        gray = apply_noise_filter(gray, iso, iso_threshold)
+    core = apply_region_mask(gray, center_fraction)
+    return Score(
+        sharpness=compute_tenengrad(core),
+        composition_score=compute_composition_score(core),
+        mean_luminance=exposure.mean_luminance,
+        clipped_highlight_pct=exposure.clipped_highlight_pct,
+        ev_offset=compute_ev_offset(exposure.mean_luminance),
+    )
+
+
+def score_item(
+    item: Tuple[str, Optional[int], int], max_dim: int, center_fraction: float
+) -> Score:
+    path, iso, orientation = item
+    return score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
+                       center_fraction=center_fraction)
+
+
+def score_images(
+    items: Iterable[Tuple[str, Optional[int], int]],
+    *,
+    max_dim: int = DEFAULT_PROXY_MAX_DIM,
+    center_fraction: float = 0.6,
+    workers: Optional[int] = None,
+) -> List[Score]:
+    """Score several JPEG previews in parallel.
+
+    ``items`` is a list of ``(path, iso, orientation)`` triples so that each
+    file's metadata is respected.
+    """
+    paths = [(str(p), iso, orient) for p, iso, orient in items]
+    if not paths:
+        return []
+    worker_count = workers or min((os.cpu_count() or 1), len(paths))
+    if worker_count <= 1 or len(paths) == 1:
+        return [
+            score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
+                       center_fraction=center_fraction)
+            for path, iso, orientation in paths
+        ]
+    payloads = [(p, iso, orient, max_dim, center_fraction) for p, iso, orient in paths]
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(_score_job, payloads))
+    return results
+
+
+def _score_job(payload: Tuple[str, Optional[int], int, int, float]) -> Score:
+    path, iso, orientation, max_dim, center_fraction = payload
+    return score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
+                       center_fraction=center_fraction)
+
+
 def compute_ev_offset(mean_luminance: float) -> float:
-    """Recommended exposure compensation: log2(128 / mean) bounded to [-2, 2].
+    """Recommended exposure compensation: log2(128 / mean) clamped to [-2, 2].
 
     Positive values mean the frame is underexposed (increase exposure);
     negative values mean it is overexposed.
@@ -134,56 +303,4 @@ def compute_ev_offset(mean_luminance: float) -> float:
     return float(max(MIN_EV_OFFSET, min(MAX_EV_OFFSET, ev)))
 
 
-def score_image(
-    jpg_path: Union[str, Path], max_dim: int = DEFAULT_PROXY_MAX_DIM
-) -> Score:
-    """One-shot scoring: proxy -> tenengrad -> composition -> exposure -> EV."""
-    gray = prepare_proxy(jpg_path, max_dim=max_dim)
-    exposure = check_exposure(gray)
-    return Score(
-        sharpness=compute_tenengrad(gray),
-        composition_score=compute_composition_score(gray),
-        mean_luminance=exposure.mean_luminance,
-        clipped_highlight_pct=exposure.clipped_highlight_pct,
-        ev_offset=compute_ev_offset(exposure.mean_luminance),
-    )
-
-
-def _score_jpeg(payload: Tuple[str, int]) -> Tuple[str, Score]:
-    path, max_dim = payload
-    try:
-        return (path, score_image(path, max_dim=max_dim))
-    except Exception as exc:  # noqa: BLE001 - corrupt preview -> error entry
-        return (
-            path,
-            Score(
-                sharpness=0.0,
-                composition_score=0.0,
-                mean_luminance=0.0,
-                clipped_highlight_pct=0.0,
-                ev_offset=0.0,
-                error=str(exc),
-            ),
-        )
-
-
-def score_images(
-    jpg_paths: Iterable[Union[str, Path]],
-    max_dim: int = DEFAULT_PROXY_MAX_DIM,
-    workers: Optional[int] = None,
-) -> List[Score]:
-    """Score many JPEG previews in parallel via ProcessPoolExecutor.
-
-    Results preserve input order.  ``workers`` defaults to min(CPU, N);
-    a value of 1 (or a single image) runs serially in-process.
-    """
-    paths = [Path(p) for p in jpg_paths]
-    if not paths:
-        return []
-    worker_count = workers or min((os.cpu_count() or 1), len(paths))
-    payloads = [(str(p), max_dim) for p in paths]
-    if worker_count <= 1 or len(paths) == 1:
-        return [score for _, score in (_score_jpeg(pwd) for pwd in payloads)]
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        results = list(executor.map(_score_jpeg, payloads))
-    return [score for _, score in results]
+analyze_image = score_image
