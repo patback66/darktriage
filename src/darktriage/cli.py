@@ -10,8 +10,10 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
@@ -40,6 +42,7 @@ from darktriage.core.engine import (
     DEFAULT_CHUNK_SIZE,
     AnalysisOptions,
     analyze_directory,
+    assessment_to_dict,
     format_label_histogram,
     format_rating_histogram,
     summarize_assessments,
@@ -131,6 +134,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "override the preview cache dir (default: per-folder "
             "$XDG_CACHE_HOME/darktriage/previews, reused across runs)"
+        ),
+    )
+    analyze.add_argument(
+        "--json-out",
+        default=None,
+        metavar="PATH",
+        help=(
+            "write machine-readable assessment JSON to PATH and emit "
+            "'darktriage-progress' lines on stderr (used by the TUI)"
         ),
     )
     analyze.set_defaults(func=cmd_analyze)
@@ -319,43 +331,70 @@ def _render_rating_summary(assessments: List[Assessment]) -> None:
 def cmd_analyze(args) -> int:
     pairs = discover_pairs(args.dir)
     use_embedded = getattr(args, "use_embedded_preview", False)
-    total = len(pairs) if use_embedded else sum(
-        1 for p in pairs if p.jpg_path is not None
+    total = (
+        len(pairs)
+        if use_embedded
+        else sum(1 for p in pairs if p.jpg_path is not None)
     )
+    machine = getattr(args, "json_out", None) is not None
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        score_task = progress.add_task("Scoring images", total=total)
-
-        def _advance_scoring() -> None:
-            progress.update(score_task, advance=1)
-
-        assessments = _analyze_directory(
+    def run(on_complete):
+        return _analyze_directory(
             args.dir,
             args.config,
             threshold_seconds=args.burst_threshold,
             max_dim=args.max_dim,
             workers=getattr(args, "threads", None),
-            on_complete=_advance_scoring,
+            on_complete=on_complete,
             use_embedded_preview=use_embedded,
             chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
             preview_cache_dir=getattr(args, "preview_cache_dir", None),
             pairs=pairs,
         )
-        progress.update(score_task, completed=total)
-        progress.stop_task(score_task)
-        progress.refresh()
 
-    _render_assessment_table(assessments, f"DarkTriage analysis: {args.dir}")
-    _render_rating_summary(assessments)
+    if machine:
+        # Machine mode (used by the TUI): write JSON to a file and stream
+        # progress on stderr; never render Rich output to stdout.
+        counter = {"done": 0}
+
+        def _emit(line: str) -> None:
+            print(line, file=sys.stderr, flush=True)
+
+        _emit(f"darktriage-progress discovered {total}")
+
+        def _advance_machine() -> None:
+            counter["done"] += 1
+            _emit(f"darktriage-progress scored {counter['done']} {total}")
+
+        assessments = run(_advance_machine)
+        Path(args.json_out).write_text(
+            json.dumps([assessment_to_dict(a) for a in assessments]),
+            encoding="utf-8",
+        )
+        _emit(f"darktriage-progress done {len(assessments)}")
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            score_task = progress.add_task("Scoring images", total=total)
+
+            def _advance_scoring() -> None:
+                progress.update(score_task, advance=1)
+
+            assessments = run(_advance_scoring)
+            progress.update(score_task, completed=total)
+            progress.stop_task(score_task)
+            progress.refresh()
+
+        _render_assessment_table(assessments, f"DarkTriage analysis: {args.dir}")
+        _render_rating_summary(assessments)
 
     if args.dry_run or args.config.safety.dry_run:
         console.print("[dim]dry-run: no XMP sidecars written[/dim]")
