@@ -14,7 +14,7 @@ class MetricsView(Vertical):
     """Metric breakdown for the currently selected image."""
 
     def update(self, assessment: Optional[Assessment]) -> None:
-        self.clear()
+        self.remove_children()
 
         if assessment is None:
             self.mount(Label("No file selected"))
