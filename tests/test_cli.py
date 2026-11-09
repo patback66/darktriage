@@ -103,3 +103,25 @@ def test_tui_analysis_command_isolates_process(tmp_path):
     assert "--dry-run" in command
     assert "--use-embedded-preview" in command
     assert "--threads" in command and "3" in command
+
+
+def test_analyze_autotag_json_includes_tags(tmp_path, capsys):
+    shoot = tmp_path / "shoot"
+    shoot.mkdir()
+    arr = np.full((120, 160, 3), (30, 140, 30), dtype=np.uint8)  # RGB green
+    Image.fromarray(arr).save(shoot / "g.JPG", quality=95)
+    (shoot / "g.NEF").write_bytes(b"RAW")
+
+    out = tmp_path / "assessments.json"
+    code = cli.main(
+        [
+            "--config", str(tmp_path / "missing.toml"),
+            "--threads", "1",
+            "analyze", str(shoot),
+            "--json-out", str(out),
+            "--dry-run", "--max-dim", "128", "--autotag",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(out.read_text())
+    assert payload and "nature" in payload[0]["tags"]

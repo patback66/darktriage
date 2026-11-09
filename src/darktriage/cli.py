@@ -137,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     analyze.add_argument(
+        "--autotag",
+        action="store_true",
+        help=(
+            "detect subject tags (people/portrait/group/landscape/nature/night) "
+            "and write them to XMP dc:Subject (additive, existing keywords kept)"
+        ),
+    )
+    analyze.add_argument(
         "--json-out",
         default=None,
         metavar="PATH",
@@ -174,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="override the preview cache dir (default: per-folder XDG cache)",
+    )
+    tui.add_argument(
+        "--autotag",
+        action="store_true",
+        help="detect subject tags and write them to XMP dc:Subject",
     )
     tui.set_defaults(func=cmd_tui)
 
@@ -261,6 +274,7 @@ def _analyze_directory(
     use_embedded_preview: bool = False,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     preview_cache_dir: Optional[str] = None,
+    autotag: bool = False,
     pairs: Optional[List[ImagePair]] = None,
 ) -> List[Assessment]:
     """Score every .NEF/.JPG pair via the bounded parallel engine."""
@@ -273,6 +287,7 @@ def _analyze_directory(
         chunk_size=chunk_size,
         use_embedded_preview=use_embedded_preview,
         preview_cache_dir=preview_cache_dir,
+        autotag=autotag,
     )
     return analyze_directory(
         directory,
@@ -293,14 +308,16 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
     table.add_column("clipped")
     table.add_column("ev")
     table.add_column("burst")
+    table.add_column("tags")
 
     for a in assessments:
         burst = "-"
         if a.burst_index is not None:
             burst = f"{a.burst_index}{'*' if a.is_burst_winner else ''}"
+        tags = ", ".join(a.tags)
 
         if a.rating is None:
-            table.add_row(a.raw_path.name, "-", "-", "-", "-", "-", burst)
+            table.add_row(a.raw_path.name, "-", "-", "-", "-", "-", burst, tags)
         else:
             table.add_row(
                 a.raw_path.name,
@@ -310,6 +327,7 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
                 f"{a.clipped_highlight_pct:.1f}%",
                 f"{a.ev_offset:+.2f}" if a.ev_offset is not None else "-",
                 burst,
+                tags,
             )
     console.print(table)
 
@@ -324,6 +342,15 @@ def _render_rating_summary(assessments: List[Assessment]) -> None:
     )
     if summary.by_label:
         console.print(f"  labels:  {format_label_histogram(summary)}")
+    tag_counts: dict = {}
+    for assessment in assessments:
+        for tag in assessment.tags:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    if tag_counts:
+        ordered = " · ".join(
+            f"{name} {count}" for name, count in sorted(tag_counts.items())
+        )
+        console.print(f"  tags:    {ordered}")
     if summary.unscoreable:
         console.print(f"  [yellow]unscoreable: {summary.unscoreable}[/yellow]")
 
@@ -349,6 +376,7 @@ def cmd_analyze(args) -> int:
             use_embedded_preview=use_embedded,
             chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
             preview_cache_dir=getattr(args, "preview_cache_dir", None),
+            autotag=getattr(args, "autotag", False),
             pairs=pairs,
         )
 
@@ -406,6 +434,7 @@ def cmd_analyze(args) -> int:
             rating=a.rating,
             label=a.label,
             ev_offset=a.ev_offset,
+            tags=a.tags,
             overwrite=args.overwrite,
         )
         for a in assessments
@@ -466,6 +495,7 @@ def cmd_tui(args) -> int:
             use_embedded_preview=getattr(args, "use_embedded_preview", False),
             chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
             preview_cache_dir=getattr(args, "preview_cache_dir", None),
+            autotag=getattr(args, "autotag", False),
         ).run()
     except ImportError as exc:
         console.print(f"[red]Textual is required for the TUI: {exc}[/red]")

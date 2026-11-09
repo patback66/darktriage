@@ -8,6 +8,7 @@ or darktable edit history is preserved unless overwrite is explicitly set.
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 from darktriage.config import Tags, Thresholds
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 _XMP_RATING_XML_RE = re.compile(r"<xmp:Rating>\s*([0-5])\s*</xmp:Rating>")
 _XMP_RATING_ATTR_RE = re.compile(r'xmp:Rating=["\']([0-5])["\']')
 _DARKTABLE_HISTORY_RE = re.compile(r"<darktable:history")
+_SUBJECT_BAG_RE = re.compile(r"<dc:subject>(.*?)</dc:subject>", re.DOTALL | re.IGNORECASE)
+_SUBJECT_LI_RE = re.compile(r"<rdf:li[^>]*>(.*?)</rdf:li>", re.DOTALL | re.IGNORECASE)
 
 # Minimal valid XMP pack used to create a brand-new sidecar file.
 MINIMAL_XMP = (
@@ -67,6 +70,7 @@ class SidecarRequest:
     rating: Optional[int]
     label: Optional[str]
     ev_offset: Optional[float] = None
+    tags: Tuple[str, ...] = ()
     overwrite: bool = False
 
 
@@ -83,6 +87,18 @@ def read_sidecar_rating(xmp_path: Union[str, Path]) -> Optional[int]:
         return None
     match = _XMP_RATING_XML_RE.search(text) or _XMP_RATING_ATTR_RE.search(text)
     return int(match.group(1)) if match else None
+
+
+def read_sidecar_subjects(xmp_path: Union[str, Path]) -> Tuple[str, ...]:
+    """Read existing ``dc:subject`` keywords from a sidecar (may be empty)."""
+    try:
+        text = Path(xmp_path).read_text(errors="replace")
+    except OSError:
+        return ()
+    bag = _SUBJECT_BAG_RE.search(text)
+    if not bag:
+        return ()
+    return tuple(html.unescape(item.strip()) for item in _SUBJECT_LI_RE.findall(bag.group(1)))
 
 
 def has_darktable_history(xmp_path: Union[str, Path]) -> bool:
@@ -202,6 +218,15 @@ class XmpWriter:
         if not xmp_path.exists() and not self.dry_run:
             xmp_path.write_text(MINIMAL_XMP, encoding="utf-8")
 
+    @staticmethod
+    def _subject_args(tags: Tuple[str, ...], has_existing: bool) -> List[str]:
+        """ExifTool args to add ``dc:subject`` keywords without clobbering."""
+        args: List[str] = []
+        for index, tag in enumerate(tags):
+            op = "+=" if has_existing or index else "="
+            args.append(f"-XMP-dc:Subject{op}{tag}")
+        return args
+
     def write(
         self,
         raw_path: Union[str, Path],
@@ -210,8 +235,9 @@ class XmpWriter:
         ev_offset: Optional[float] = None,
         *,
         overwrite: bool = False,
+        tags: Tuple[str, ...] = (),
     ) -> WriteResult:
-        """Write Rating/Label/Description to ``<raw>.xmp`` (sidecar only)."""
+        """Write Rating/Label/Description (and optional subject tags)."""
         raw_path = Path(raw_path)
         xmp_path = xmp_sidecar_path(raw_path)
 
@@ -226,7 +252,14 @@ class XmpWriter:
                 skipped=True,
             )
 
+        existing_subjects = read_sidecar_subjects(xmp_path)
+        new_subjects = tuple(
+            tag for tag in dict.fromkeys(tags) if tag and tag not in existing_subjects
+        )
+
         args = self._build_args(rating, label, ev_offset)
+        if new_subjects:
+            args.extend(self._subject_args(new_subjects, bool(existing_subjects)))
         command = [self.exiftool] + args + [str(xmp_path)]
 
         if self.verbose:
@@ -276,6 +309,16 @@ class XmpWriter:
             lines.extend(
                 self._build_args(request.rating, request.label, request.ev_offset)
             )
+            if request.tags:
+                sidecar = xmp_sidecar_path(request.raw_path)
+                existing = read_sidecar_subjects(sidecar)
+                new_tags = tuple(
+                    tag
+                    for tag in dict.fromkeys(request.tags)
+                    if tag and tag not in existing
+                )
+                if new_tags:
+                    lines.extend(self._subject_args(new_tags, bool(existing)))
             lines.append(str(xmp_sidecar_path(request.raw_path)))
         return lines
 

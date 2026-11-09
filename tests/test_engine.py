@@ -135,3 +135,20 @@ def test_summarize_assessments_counts():
     assert summary.by_label["none"] == 1
     assert "5★ 1" in format_rating_histogram(summary, percent=True)
     assert "purple 1" in format_label_histogram(summary)
+
+
+def test_engine_autotag_sets_tags(tmp_path):
+    from darktriage.config import load_config
+    from darktriage.core.engine import AnalysisOptions, analyze_directory
+
+    arr = np.full((120, 160, 3), (30, 140, 30), dtype=np.uint8)  # RGB green
+    Image.fromarray(arr).save(tmp_path / "g.JPG", quality=95)
+    (tmp_path / "g.NEF").write_bytes(b"RAW")
+
+    assessments = analyze_directory(
+        str(tmp_path),
+        load_config(tmp_path / "nope.toml"),
+        AnalysisOptions(max_dim=128, workers=1, autotag=True),
+    )
+    assert len(assessments) == 1
+    assert "nature" in assessments[0].tags

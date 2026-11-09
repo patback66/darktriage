@@ -84,6 +84,7 @@ class DarkTriageApp(App):
         use_embedded_preview: bool = False,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         preview_cache_dir: Optional[str] = None,
+        autotag: bool = False,
     ):
         super().__init__()
         self.assessments: List[Assessment] = list(assessments or [])
@@ -95,6 +96,7 @@ class DarkTriageApp(App):
         self.use_embedded_preview = use_embedded_preview
         self.chunk_size = chunk_size
         self.preview_cache_dir = preview_cache_dir
+        self.autotag = autotag
         self.selected: Optional[Assessment] = None
         self._commit_in_progress = False
         self._analysis_ready = False
@@ -176,6 +178,8 @@ class DarkTriageApp(App):
         ]
         if self.use_embedded_preview:
             command.append("--use-embedded-preview")
+        if self.autotag:
+            command.append("--autotag")
         if self.preview_cache_dir:
             command += ["--preview-cache-dir", str(self.preview_cache_dir)]
         if self.threshold is not None:
@@ -266,6 +270,14 @@ class DarkTriageApp(App):
             text = format_rating_histogram(summary, percent=True)
             if summary.by_label:
                 text += "  |  " + format_label_histogram(summary)
+            tag_counts: dict = {}
+            for assessment in self.assessments:
+                for tag in assessment.tags:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            if tag_counts:
+                text += "  |  tags: " + " · ".join(
+                    f"{name} {count}" for name, count in sorted(tag_counts.items())
+                )
             if summary.unscoreable:
                 text += f"  |  unscoreable {summary.unscoreable}"
             self.query_one("#summary", Label).update(text)
@@ -312,6 +324,7 @@ class DarkTriageApp(App):
                 rating=a.rating,
                 label=a.label,
                 ev_offset=a.ev_offset,
+                tags=a.tags,
             )
             for a in self.assessments
             if a.rating is not None

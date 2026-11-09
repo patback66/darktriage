@@ -44,6 +44,7 @@ class MetricsView(Vertical):
             ("Clipped highlights", f"{assessment.clipped_highlight_pct:.1f}%"),
             ("EV offset", f"{assessment.ev_offset:+.2f}" if assessment.ev_offset is not None else "-"),
             ("Burst", burst),
+            ("Tags", ", ".join(assessment.tags) or "-"),
         ]
         for name, value in rows:
             self.mount(Label(f"[b]{name}:[/b] {value}"))
