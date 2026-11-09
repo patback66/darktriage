@@ -1,90 +1,77 @@
-"""Tests for DarkTriage OpenCV metrics."""
+"""Tests for darktriage.core.metrics."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
 
 from darktriage.core.metrics import (
-    Rating,
-    analyze_image,
-    composition_report,
-    exposure_report,
-    tenengrad_sharpness,
+    ExposureReport,
+    Score,
+    check_exposure,
+    compute_composition_score,
+    compute_tenengrad,
+    prepare_proxy,
+    score_image,
 )
 
-# A high-frequency (sharp) 64x64 checkerboard pattern.
-_SHARP = np.tile(np.array([[0, 255], [255, 0]], dtype=np.uint8), (32, 32))
-_SHARP = np.repeat(np.repeat(_SHARP, 2, axis=0), 2, axis=1)
 
-# A smooth, low-frequency gradient (behaves like a soft image for Tenengrad).
-_BLUR = np.tile(np.linspace(0, 255, 64, dtype=np.uint8), (64, 1))
+def _sharp_pattern() -> np.ndarray:
+    grid = np.tile(np.array([[0, 255], [255, 0]], dtype=np.uint8), (64, 64))
+    return np.repeat(np.repeat(grid, 2, axis=0), 2, axis=1)
 
 
-def test_to_grayscale_handles_rgb_and_rgba():
-    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
-    rgba = np.zeros((8, 8, 4), dtype=np.uint8)
-    assert tenengrad_sharpness(rgb.astype(np.uint8)) == 0.0
-    assert tenengrad_sharpness(rgba.astype(np.uint8)) == 0.0
-
-
-def test_tenengrad_sharpness_ranks_sharp_above_blurred():
-    sharp = tenengrad_sharpness(_SHARP.astype(np.uint8))
-    blurred = tenengrad_sharpness(_BLUR.astype(np.uint8))
-    assert sharp > 0.0
-    assert sharp > blurred
-
-
-def test_tenengrad_sharpness_is_resolution_independent():
-    resized = np.array(Image.fromarray(_SHARP).resize((32, 32)), dtype=np.uint8)
-    assert tenengrad_sharpness(resized) > 0.0
-
-
-def test_exposure_report_counts_clipping_on_solid_white():
-    white = np.full((64, 64), 255, dtype=np.uint8)
-    report = exposure_report(white)
-    assert report["highlight_ratio"] > 0.5
-    assert report["clipped"] is True
-    assert report["mean_luminance"] == 255.0
-
-
-def test_exposure_report_counts_clipping_on_black():
-    black = np.zeros((64, 64), dtype=np.uint8)
-    report = exposure_report(black)
-    assert report["highlight_ratio"] == 0.0
-    assert report["underexposed"] > 0.99
-
-
-def test_composition_report_returns_grid_samples():
-    report = composition_report(_SHARP)
-    assert len(report["cell_luminances"]) == 9
-    assert len(report["node_luminances"]) == 4
-    assert 0.0 <= report["composition_score"] <= 100.0
-
-
-def test_analyze_image_returns_rating_and_label():
-    metrics = analyze_image(_SHARP)
-    assert "sharpness" in metrics
-    assert "exposure" in metrics
-    assert "composition" in metrics
-    rating = metrics["rating"]
-    assert isinstance(rating, Rating)
-    assert 1 <= rating.rating <= 5
-    assert rating.label in {"red", "yellow", "green", "purple"}
-
-
-def test_analyze_image_accepts_numpy_array(tmp_path):
-    image = Image.fromarray(_SHARP)
-    path = tmp_path / "sharp.jpg"
+def test_prepare_proxy_downscales_long_edge(tmp_path):
+    image = Image.new("L", (4000, 2000), 128).convert("RGB")
+    path = tmp_path / "big.jpg"
     image.save(path)
-    via_array = analyze_image(_SHARP)
-    via_file = analyze_image(path)
-    assert via_array["rating"].rating == via_file["rating"].rating
+    proxy = prepare_proxy(path, max_dim=1920)
+    assert proxy.ndim == 2
+    assert max(proxy.shape) <= 1920
+    assert proxy.dtype == np.uint8
 
 
-def test_analyze_image_rejects_unknown_types():
-    with pytest.raises(TypeError):
-        analyze_image(object())  # type: ignore[arg-type]
+def test_prepare_proxy_keeps_small_images_unchanged(tmp_path):
+    image = Image.new("L", (64, 64), 128).convert("RGB")
+    path = tmp_path / "small.jpg"
+    image.save(path)
+    proxy = prepare_proxy(path, max_dim=1920)
+    assert proxy.shape == (64, 64)
+
+
+def test_compute_tenengrad_sharp_beats_flat():
+    sharp = _sharp_pattern()
+    flat = np.full((128, 128), 128, dtype=np.uint8)
+    assert compute_tenengrad(sharp) > 0.0
+    assert compute_tenengrad(sharp) > compute_tenengrad(flat)
+
+
+def test_compute_composition_score_in_range():
+    arr = np.random.default_rng(0).integers(0, 256, (256, 256), dtype=np.uint8)
+    score = compute_composition_score(arr)
+    assert 0.0 <= score <= 1.0
+
+
+def test_check_exposure_counts_clipped_highlights():
+    arr = np.full((100, 100), 200, dtype=np.uint8)
+    arr[:, :30] = 255  # 30% clipped
+    report = check_exposure(arr)
+    assert isinstance(report, ExposureReport)
+    assert report.clipped_highlight_pct == pytest.approx(30.0)
+
+
+def test_check_exposure_returns_zero_for_black():
+    arr = np.zeros((64, 64), dtype=np.uint8)
+    report = check_exposure(arr)
+    assert report.clipped_highlight_pct == 0.0
+
+
+def test_score_image_end_to_end(tmp_path):
+    path = tmp_path / "sharp.jpg"
+    Image.fromarray(_sharp_pattern()).save(path)
+    score = score_image(path, max_dim=512)
+    assert isinstance(score, Score)
+    assert score.sharpness > 0.0
+    assert 0.0 <= score.composition_score <= 1.0
+    assert score.mean_luminance > 0.0

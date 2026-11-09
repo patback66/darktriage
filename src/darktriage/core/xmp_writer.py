@@ -1,15 +1,7 @@
-"""ExifTool sidecar writer for DarkTriage XMP metadata.
+"""ExifTool-based XMP sidecar writer for DarkTriage.
 
-DarkTriage writes two XMP bits per image:
-
-* ``XmpRating``  - star rating (1-5).
-* ``XmpLabel``   - darktable color label (Red=Blur, Yellow=Overexposed,
-                   Green=Keeper, Purple=Portfolio).
-
-All writes are performed by invoking the ``exiftool`` binary through
-``subprocess``.  The class is fully testable: pass an explicit path to a
-fake ``exiftool`` binary (or use ``dry_run=True``) to verify the exact
-command lines it constructs.
+Writes non-destructive Darktable/Adobe XMP tags (Rating + Label) to
+``<raw>.xmp`` sidecars via the ExifTool command line.
 """
 
 from __future__ import annotations
@@ -17,48 +9,93 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
-import sys
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
-
-# Darktable label numbers: 1 = Red, 2 = Yellow, 3 = Green, 4 = Purple.
-LABEL_BY_NAME = {
-    "red": "1",
-    "yellow": "2",
-    "green": "3",
-    "purple": "4",
-}
-LABEL_BY_VALUE = {v: k for k, v in LABEL_BY_NAME.items()}
-LABEL_NAMES = sorted(LABEL_BY_NAME)
-
-RATING_MIN = 1
-RATING_MAX = 5
+from pathlib import Path
+from typing import List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+# Darktable label names written to the XMP-xmp:Label tag.
+LABEL_RED = "Red"
+LABEL_YELLOW = "Yellow"
+LABEL_GREEN = "Green"
+LABEL_PURPLE = "Purple"
+
+# Tunable thresholds for deriving a rating decision.  Tenengrad values are
+# resolution-normalised by the 1920px proxy produced in metrics.prepare_proxy.
+SHARPNESS_HIGH = 250.0
+SHARPNESS_LOW = 40.0
+COMPOSITION_STRONG = 0.6
+CLIP_PCT_THRESHOLD = 5.0
+
 
 class ExifToolNotFoundError(RuntimeError):
-    """Raised when the ``exiftool`` binary cannot be located on PATH."""
+    """Raised when the exiftool binary cannot be located on PATH."""
 
 
-class ExifToolError(RuntimeError):
-    """Raised when exiftool exits with a non-zero status."""
+@dataclass(frozen=True)
+class RatingDecision:
+    """Star rating and colour label derived from scored metrics."""
+
+    rating: int
+    label: Optional[str]  # None means no label
 
 
 @dataclass(frozen=True)
 class WriteResult:
-    """Result of a single XMP write operation."""
+    """Outcome of a single XMP sidecar write."""
 
-    path: str
+    raw_path: Path
     rating: Optional[int]
-    label: Optional[str]  # label name (red/yellow/green/purple)
+    label: Optional[str]
     command: List[str]
     success: bool
     stderr: str = ""
 
 
+def xmp_sidecar_path(raw_path: Union[str, Path]) -> Path:
+    """Return the conventional ``<raw>.xmp`` sidecar path for a raw file."""
+    return Path(str(raw_path) + ".xmp")
+
+
+def derive_rating_and_label(
+    *,
+    sharpness: float,
+    composition_score: float,
+    clipped_pct: float,
+    is_burst_winner: bool = False,
+) -> RatingDecision:
+    """Map scored metrics onto the DarkTriage rating/label rule set.
+
+    Rules (evaluated in order):
+
+    * burst winner + high sharpness + strong composition -> 5 stars, Purple
+    * crisp focus / keeper -> 4 stars, Green
+    * soft focus / blur -> 1 star, Red
+    * otherwise -> 3 stars, no label
+    * highlight clipping > 5% overrides the label to Yellow
+    """
+    if (
+        is_burst_winner
+        and sharpness >= SHARPNESS_HIGH
+        and composition_score >= COMPOSITION_STRONG
+    ):
+        rating, label = 5, LABEL_PURPLE
+    elif sharpness >= SHARPNESS_HIGH:
+        rating, label = 4, LABEL_GREEN
+    elif sharpness <= SHARPNESS_LOW:
+        rating, label = 1, LABEL_RED
+    else:
+        rating, label = 3, None
+
+    if clipped_pct > CLIP_PCT_THRESHOLD:
+        label = LABEL_YELLOW
+
+    return RatingDecision(rating=rating, label=label)
+
+
 class XmpWriter:
-    """Wrapper around the ``exiftool`` command line."""
+    """Wrapper around the exiftool command line."""
 
     def __init__(
         self,
@@ -67,150 +104,72 @@ class XmpWriter:
         dry_run: bool = False,
         verbose: bool = False,
     ):
-        self.exiftool = self._resolve_tool(exiftool)
+        self.exiftool = self._resolve(exiftool)
         self.dry_run = dry_run
         self.verbose = verbose
 
     @staticmethod
-    def _resolve_tool(exiftool: str) -> str:
-        """Return the resolved executable path for the given tool name."""
+    def _resolve(exiftool: str) -> str:
         if exiftool == "exiftool":
             resolved = shutil.which("exiftool")
             if resolved is None:
                 raise ExifToolNotFoundError(
-                    "exiftool was not found on PATH. Install it (e.g. "
-                    "``apt install libimage-exiftool-perl`` or "
-                    "``brew install exiftool``) or pass the full path."
+                    "exiftool not found on PATH. Install it (e.g. apt install "
+                    "libimage-exiftool-perl) or pass its absolute path."
                 )
             return resolved
         return exiftool
 
-    def _run(self, argv: List[str]) -> subprocess.CompletedProcess:
-        """Execute exiftool with the supplied arguments."""
-        command = [self.exiftool] + argv
+    @staticmethod
+    def _build_args(rating: int, label: Optional[str]) -> List[str]:
+        args = [f"-XMP-xmp:Rating={rating}"]
+        # Write an empty label when none is requested to clear any previous
+        # label left from an earlier run.
+        args.append(f"-XMP-xmp:Label={label if label else ''}")
+        args.append("-overwrite_original")
+        return args
+
+    def write(
+        self,
+        raw_path: Union[str, Path],
+        rating: int,
+        label: Optional[str] = None,
+    ) -> WriteResult:
+        """Write Rating + Label XMP tags for a single raw path."""
+        raw_path = Path(raw_path)
+        args = self._build_args(rating, label)
+        command = [self.exiftool] + args + [str(raw_path)]
+
         if self.verbose:
             logger.info("exiftool: %s", " ".join(command))
         if self.dry_run:
-            return subprocess.CompletedProcess(
-                args=command, returncode=0, stdout="", stderr=""
+            return WriteResult(
+                raw_path=raw_path,
+                rating=rating,
+                label=label,
+                command=command,
+                success=True,
             )
-        proc = subprocess.run(
-            command, capture_output=True, text=True
-        )
+
+        proc = subprocess.run(command, capture_output=True, text=True)
         if proc.returncode != 0:
             logger.warning(
                 "exiftool failed (%s) for %s: %s",
                 proc.returncode,
-                " ".join(command),
+                raw_path,
                 proc.stderr.strip(),
             )
-        return proc
-
-    def _validate(self, path: str, rating: Optional[int] = None, label: Optional[str] = None) -> None:
-        if rating is not None:
-            if isinstance(rating, bool) or not isinstance(rating, int):
-                raise ValueError(
-                    f"Rating must be an integer between {RATING_MIN} and {RATING_MAX}, got {rating!r}"
-                )
-            if not (RATING_MIN <= rating <= RATING_MAX):
-                raise ValueError(
-                    f"Rating must be between {RATING_MIN} and {RATING_MAX}, got {rating}"
-                )
-        if label is not None and label not in LABEL_BY_NAME:
-            raise ValueError(
-                f"Unknown label {label!r}; expected one of {LABEL_NAMES}"
-            )
-
-    def write_rating(
-        self, path: str, rating: int
-    ) -> WriteResult:
-        """Write a star rating to ``path`` via exiftool."""
-        path = str(path)
-        self._validate(path, rating=rating)
-        proc = self._run(["-XmpRating=%d" % rating, path])
         return WriteResult(
-            path=path,
-            rating=rating,
-            label=None,
-            command=proc.args,
-            success=proc.returncode == 0,
-            stderr=proc.stderr,
-        )
-
-    def write_label(self, path: str, label: str) -> WriteResult:
-        """Write a Darktable color label to ``path`` via exiftool."""
-        path = str(path)
-        self._validate(path, label=label)
-        value = LABEL_BY_NAME[label]
-        proc = self._run(["-XmpLabel=%s" % value, path])
-        return WriteResult(
-            path=path,
-            rating=None,
-            label=label,
-            command=proc.args,
-            success=proc.returncode == 0,
-            stderr=proc.stderr,
-        )
-
-    def write_sidecar(
-        self,
-        path: str,
-        *,
-        rating: Optional[int] = None,
-        label: Optional[str] = None,
-    ) -> WriteResult:
-        """Write rating and/or label for a single file.
-
-        Returns a single consolidated :class:`WriteResult` containing the
-        rating, label (if any) and the full exiftool command line.
-        """
-        path = str(path)
-        results = []
-        if rating is not None:
-            results.append(self.write_rating(path, rating))
-        if label is not None:
-            results.append(self.write_label(path, label))
-
-        if not results:
-            return WriteResult(
-                path=path, rating=None, label=None, command=[], success=True
-            )
-
-        # Combine the individual results into one WriteResult.
-        command: List[str] = []
-        stderr = ""
-        for result in results:
-            command.extend(result.command)
-            stderr += result.stderr
-        rating = next((r.rating for r in results if r.rating is not None), None)
-        label = next((r.label for r in results if r.label is not None), None)
-        return WriteResult(
-            path=path,
+            raw_path=raw_path,
             rating=rating,
             label=label,
             command=command,
-            success=all(r.success for r in results),
-            stderr=stderr,
+            success=proc.returncode == 0,
+            stderr=proc.stderr,
         )
 
-    def write_batch(
-        self,
-        paths: Iterable[str],
-        *,
-        rating: Optional[int] = None,
-        label: Optional[str] = None,
-    ) -> List[WriteResult]:
-        """Write the same rating/label across many files (batch commit)."""
-        results = []
-        for path in sorted(paths):
-            results.append(self.write_sidecar(path, rating=rating, label=label))
-        return results
-
-    @classmethod
-    def create_from_env(
-        cls, *, dry_run: bool = False, verbose: bool = False
-    ) -> "XmpWriter":
-        """Build an XmpWriter honoring ``DARKTRIAGE_EXIFTOOL`` if set."""
-        exiftool = shutil.which("exiftool") or \
-            __import__("os").environ.get("DARKTRIAGE_EXIFTOOL", "exiftool")
-        return cls(exiftool, dry_run=dry_run, verbose=verbose)
+    def write_decision(
+        self, raw_path: Union[str, Path], decision: RatingDecision
+    ) -> WriteResult:
+        """Write a RatingDecision to ``raw_path``."""
+        return self.write(raw_path, decision.rating, decision.label)

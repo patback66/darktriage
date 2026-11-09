@@ -1,92 +1,132 @@
-"""Headless batch export engine for DarkTriage.
+"""Headless darktable-cli batch export for DarkTriage.
 
-Wraps ``darktable-cli`` and prepares a deterministic command plan before
-executing it.  The renderer streams the source RAW/DNG images through the
-selected darktable style and writes final JPEG/TIFF outputs into the
-requested output directory.
+Reads each ``.NEF`` file's ``.xmp`` rating and renders the high-rated shots
+to JPEG via ``darktable-cli``.  JPEG quality/compression is driven by the
+selected darktable style; the output extension (``.jpg``) selects JPEG export.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-log = logging.getLogger(__name__)
+from darktriage.core.xmp_writer import xmp_sidecar_path
+
+logger = logging.getLogger(__name__)
+
+_XMP_RATING_XML = re.compile(r"<xmp:Rating>\s*([0-5])\s*</xmp:Rating>")
+_XMP_RATING_ATTR = re.compile(r'xmp:Rating=["\']([0-5])["\']')
 
 
 @dataclass(frozen=True)
+class ExportJob:
+    """One raw file queued for headless export."""
+
+    nef: Path
+    xmp: Path
+    output: Path
+    rating: int
+
+
+@dataclass
 class ExportResult:
-    """Outcome of a headless export run."""
+    """Outcome of a batch export run."""
 
-    success: bool
-    frames: int
-    command: List[str]
-    stderr: str = ""
+    jobs: List[ExportJob] = field(default_factory=list)
+    commands: List[List[str]] = field(default_factory=list)
+    skipped: List[Path] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    dry_run: bool = False
+
+    @property
+    def success(self) -> bool:
+        return not self.errors
 
 
-def _iter_image_files(directory: Path) -> List[Path]:
-    """Return the image files (RAW/JPEG) inside ``directory``, sorted."""
-    extensions = {
-        ".jpg", ".jpeg", ".png", ".tif", ".tiff",
-        ".raf", ".arw", ".cr2", ".cr3", ".nrw", ".nef",
-        ".rw2", ".dng", ".orf", ".rwl", ".raw",
-    }
-    return sorted(
-        p for p in Path(directory).iterdir()
-        if p.is_file() and p.suffix.lower() in extensions
-    )
+def read_xmp_rating(xmp_path: Path) -> Optional[int]:
+    """Parse the integer xmp:Rating from a sidecar, if present."""
+    try:
+        text = Path(xmp_path).read_text(errors="replace")
+    except OSError:
+        return None
+    match = _XMP_RATING_XML.search(text) or _XMP_RATING_ATTR.search(text)
+    return int(match.group(1)) if match else None
 
 
 def build_command(
-    raw_dir: str,
-    style: str,
-    output: str,
-    *,
-    dry_run: bool = False,
+    job: ExportJob,
+    style_name: Optional[str] = None,
     darktable_cli: str = "darktable-cli",
 ) -> List[str]:
-    """Build the darktable-cli command for a batch export.
-
-    The CLI argument surface varies between darktable versions, so this
-    helper keeps the invocation deterministic and easily overridden for
-    testing.  ``--dry-run`` only affects logging, not the command shape.
-    """
-    files = [str(p) for p in _iter_image_files(Path(raw_dir))]
-    command = [darktable_cli, "-o", str(output), "--style", style] + files
+    """Build a darktable-cli invocation for one job (input [xmp] output)."""
+    command = [darktable_cli, str(job.nef)]
+    if job.xmp.exists():
+        command.append(str(job.xmp))
+    command.append(str(job.output))
+    if style_name:
+        command += ["--style", style_name]
     return command
 
 
-def run_export(
-    raw_dir: str,
-    style: str,
-    output: str,
+def batch_export(
+    target_dir,
     *,
+    min_rating: int = 4,
+    style_name: Optional[str] = None,
+    output_dir: Optional[str] = None,
     dry_run: bool = False,
     darktable_cli: str = "darktable-cli",
 ) -> ExportResult:
-    """Run (or plan) a headless batch export."""
-    files = _iter_image_files(Path(raw_dir))
-    frames = len(files)
-    command = build_command(
-        raw_dir, style, output, dry_run=dry_run, darktable_cli=darktable_cli
-    )
-    log.info("darktable-cli: %s", " ".join(command))
+    """Export .NEF files rated >= ``min_rating`` using darktable-cli.
 
-    if dry_run:
-        return ExportResult(
-            success=True, frames=frames, command=command, stderr=""
+    Iterates every .NEF in ``target_dir``, reads the companion .xmp rating,
+    and renders qualifying shots (JPEG, 95% quality controlled by the style)
+    into ``output_dir`` (defaults to ``<target_dir>/export``).
+    """
+    directory = Path(target_dir)
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Not a directory: {directory}")
+
+    output = Path(output_dir) if output_dir else directory / "export"
+    if not dry_run:
+        output.mkdir(parents=True, exist_ok=True)
+
+    result = ExportResult(dry_run=dry_run)
+
+    nef_files = sorted(directory.glob("*.NEF")) + sorted(directory.glob("*.nef"))
+    for nef in nef_files:
+        xmp = xmp_sidecar_path(nef)
+        rating = read_xmp_rating(xmp)
+
+        if rating is None or rating < min_rating:
+            result.skipped.append(nef)
+            continue
+
+        job = ExportJob(
+            nef=nef,
+            xmp=xmp,
+            output=output / (nef.stem + ".jpg"),
+            rating=rating,
         )
+        result.jobs.append(job)
 
-    proc = subprocess.run(command, capture_output=True, text=True)
-    log.info("darktable-cli exited with %s", proc.returncode)
-    if proc.stderr.strip():
-        log.debug(proc.stderr)
-    return ExportResult(
-        success=proc.returncode == 0,
-        frames=frames,
-        command=command,
-        stderr=proc.stderr,
-    )
+        command = build_command(job, style_name, darktable_cli)
+        result.commands.append(command)
+        if dry_run:
+            continue
+
+        logger.info("darktable-cli: %s", " ".join(command))
+        proc = subprocess.run(command, capture_output=True, text=True)
+        if proc.returncode != 0:
+            message = (
+                f"darktable-cli failed for {nef} ({proc.returncode}): "
+                f"{proc.stderr.strip()}"
+            )
+            logger.warning(message)
+            result.errors.append(message)
+
+    return result

@@ -1,92 +1,98 @@
-"""Textual TUI Application instance for DarkTriage."""
+"""Textual TUI dashboard for DarkTriage."""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import List, Optional
 
-from darktriage.core.metrics import analyze_image
+from darktriage.core.exif_reader import Assessment
+from darktriage.core.xmp_writer import ExifToolNotFoundError, XmpWriter
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Header, Label, ListItem, ListView
+from textual.widgets import Button, Footer, Header, Label
 
 from .widgets import MetricsView
 
 
-class FileListView(ListView):
-    """List of triaged files with persistent file paths (for selection)."""
-
-    def __init__(self, paths: Iterable[Path], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.paths = list(paths)
-        self.selected_path: Optional[Path] = None
-
-    def set_paths(self, paths: Iterable[Path]) -> None:
-        self.paths = list(paths)
-        self.clear()
-        for p in self.paths:
-            with ListItem():
-                yield Button(str(p.name), id=f"file-{p.name}", value=p)
-
-    def on_button_pressed(self, event) -> None:
-        button = event.sender
-        if hasattr(button, "value") and button.value is not None:
-            self.selected_path = button.value  # type: ignore[attr-defined]
-            self.app.update_metrics(self.selected_path)
-
-
 class DarkTriageApp(App):
-    """Terminal dashboard for triaging a RAW folder and viewing metrics."""
+    """Interactive dashboard: image list, metric breakdown, XMP commit."""
 
     CSS = """
-    Button.file-item {
+    #file-list Button {
         width: 100%;
     }
-    #metrics-view Label {
+    #metrics-view {
+        min-height: 7;
+        border: round $accent;
         padding: 1 2;
     }
     """
-    BINDINGS = [("q", "app.quit", "Quit"), ("d", "toggle_debug", "Debug")]
+
+    BINDINGS = [("q", "quit", "Quit")]
 
     def __init__(
         self,
-        file_paths: Optional[Iterable[Path]] = None,
-        metrics_map: Optional[Dict[Path, dict]] = None,
-        *args,
-        **kwargs,
+        assessments: Optional[List[Assessment]] = None,
+        directory: Optional[str] = None,
     ):
-        super().__init__(*args, **kwargs)
-        self.file_paths = list(file_paths or [])
-        self.metrics_map = metrics_map or {}
-        self.selected_path: Optional[Path] = None
+        super().__init__()
+        self.assessments = list(assessments or [])
+        self.directory = directory or ""
+        self.selected: Optional[Assessment] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with VerticalScroll():
-            yield FileListView(self.file_paths, id="file-list")
+        with VerticalScroll(id="file-list"):
+            for assessment in self.assessments:
+                yield Button(
+                    assessment.raw_path.name,
+                    id=f"file-{assessment.raw_path.stem}",
+                    classes="file-item",
+                )
         with Vertical():
-            yield Label("Select a file to view its triage metrics")
             yield MetricsView(id="metrics-view")
+            yield Button("Commit XMP sidecars", id="commit", variant="success")
         yield Footer()
 
     def on_mount(self) -> None:
-        file_list = self.query_one(FileListView)
-        file_list.set_paths(self.file_paths)
-        if self.file_paths:
-            file_list.selected_path = self.file_paths[0]
-            self.update_metrics(self.file_paths[0])
+        self.selected = self.assessments[0] if self.assessments else None
+        self._refresh_metrics()
+
+    def _refresh_metrics(self) -> None:
+        self.query_one(MetricsView).update(self.selected)
+
+    def _assessment_for_button(self, button: Button) -> Optional[Assessment]:
+        for assessment in self.assessments:
+            if button.id == f"file-{assessment.raw_path.stem}":
+                return assessment
+        return None
 
     def on_button_pressed(self, event) -> None:
-        file_list = self.query_one(FileListView)
-        file_list.on_button_pressed(event)
+        button = event.button
+        if button.id == "commit":
+            self._commit_sidecars()
+            return
 
-    def update_metrics(self, path: Path) -> None:
-        self.selected_path = path
-        metrics = self.metrics_map.get(path)
-        metrics_view = self.query_one(MetricsView)
-        metrics_view.update(metrics)
+        assessment = self._assessment_for_button(button)
+        if assessment is not None:
+            self.selected = assessment
+            self._refresh_metrics()
 
-    def action_toggle_debug(self) -> None:
-        self.log.debug("Debug logging toggled")
-        self.notify("Debug output toggled")
+    def _commit_sidecars(self) -> None:
+        try:
+            writer = XmpWriter()
+        except ExifToolNotFoundError as exc:
+            self.notify(str(exc), severity="error")
+            return
+
+        written = 0
+        for assessment in self.assessments:
+            if assessment.rating is None:
+                continue
+            result = writer.write(
+                assessment.raw_path, assessment.rating, assessment.label
+            )
+            if result.success:
+                written += 1
+
+        self.notify(f"Committed XMP sidecars for {written} file(s)")

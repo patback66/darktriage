@@ -1,84 +1,104 @@
-"""Tests for DarkTriage EXIF parsing and burst detection."""
+"""Tests for darktriage.core.exif_reader."""
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pytest
 from PIL import Image
 
 from darktriage.core.exif_reader import (
-    ExifParsingError,
-    ExifRecord,
-    group_burst_sequences,
-    read_records,
+    DEFAULT_BURST_SECONDS,
+    ImagePair,
+    decode_capture_time,
+    detect_bursts,
+    discover_pairs,
+    read_capture_time,
+    select_burst_winners,
 )
 
-NOW = datetime(2024, 1, 1, 12, 0, 0)
+
+def _jpeg_with_exif(path: Path, dt: str | None = None, subsec: str | None = None) -> None:
+    image = Image.new("RGB", (8, 8), "deepskyblue")
+    exif = Image.Exif()
+    if dt:
+        exif[0x9003] = dt
+    if subsec is not None:
+        exif[0x9291] = subsec
+    image.save(path, exif=exif)
 
 
-def _make_image(tmp_path: Path, *, exif: dict | None = None) -> Path:
-    image = Image.new("RGB", (64, 64), "deepskyblue")
-    path = tmp_path / "sample.jpg"
-    pillow_exif = Image.Exif()
-    if exif:
-        pillow_exif.update(exif)
-    image.save(path, exif=pillow_exif)
-    return path
+def test_decode_capture_time_combines_sub_second():
+    result = decode_capture_time("2024:01:01 12:00:00", subsec="123456")
+    assert result == datetime(2024, 1, 1, 12, 0, 0, 123456)
 
 
-def test_read_records_extracts_capture_time(tmp_path):
-    path = _make_image(tmp_path, exif={0x9003: "2024:01:01 12:00:00"})
-    records = read_records([path])
-    assert len(records) == 1
-    assert records[0].capture_time == NOW
+def test_decode_capture_time_none_when_missing():
+    assert decode_capture_time(None) is None
 
 
-def test_read_records_handles_missing_exif(tmp_path):
-    path = _make_image(tmp_path)
-    records = read_records([path])
-    assert records[0].capture_time is None
-    assert records[0].camera_model is None
+def test_decode_capture_time_sub_second_padded():
+    result = decode_capture_time("2024:01:01 12:00:00", subsec="12")
+    assert result.microsecond == 120000
 
 
-def test_record_to_dict_roundtrip(tmp_path):
-    path = _make_image(tmp_path)
-    record = read_records([path])[0]
-    data = record.to_dict()
-    assert data["path"] == str(path)
-    assert data["capture_time"] is None
+def test_read_capture_time_from_jpeg(tmp_path):
+    path = tmp_path / "sample.JPG"
+    _jpeg_with_exif(path, dt="2024:01:01 12:00:00", subsec="123456")
+    assert read_capture_time(path) == datetime(2024, 1, 1, 12, 0, 0, 123456)
 
 
-def test_group_burst_sequences_groups_close_shots(tmp_path):
-    records = [
-        ExifRecord(path=Path(f"f{i}.jpg"), capture_time=NOW + timedelta(seconds=i * 0.2))
-        for i in range(5)
+def test_read_capture_time_returns_none_for_corrupt_header(tmp_path):
+    path = tmp_path / "bad.jpg"
+    path.write_bytes(b"not a real jpeg")
+    assert read_capture_time(path) is None
+
+
+def test_discover_pairs_matches_nef_with_jpg(tmp_path):
+    (tmp_path / "A.NEF").write_bytes(b"raw")
+    (tmp_path / "B.NEF").write_bytes(b"raw")
+    _jpeg_with_exif(tmp_path / "A.JPG", dt="2024:01:01 12:00:00")  # B has no JPG
+
+    pairs = discover_pairs(tmp_path)
+    assert len(pairs) == 2
+    by_stem = {p.raw_path.stem: p for p in pairs}
+    assert by_stem["A"].jpg_path == tmp_path / "A.JPG"
+    assert by_stem["A"].capture_time is not None
+    assert by_stem["B"].jpg_path is None
+    assert by_stem["B"].capture_time is None
+
+
+def test_detect_bursts_groups_close_shots():
+    base = datetime(2024, 1, 1, 12, 0, 0)
+    pairs = [
+        ImagePair(
+            raw_path=Path(f"{i}.NEF"),
+            jpg_path=None,
+            capture_time=base + timedelta(seconds=i * 0.4),
+        )
+        for i in range(4)
     ]
-    clusters = group_burst_sequences(records, max_gap=timedelta(seconds=1.0))
-    assert len(clusters) == 1
-    assert len(clusters[0]) == 5
+    pairs.append(
+        ImagePair(raw_path=Path("far.NEF"), jpg_path=None, capture_time=base + timedelta(seconds=30))
+    )
+
+    groups = detect_bursts(pairs, threshold_seconds=2.0)
+    assert len(groups) == 2
+    assert len(groups[0].images) == 4
+    assert len(groups[1].images) == 1
 
 
-def test_group_burst_sequences_splits_on_larger_gap(tmp_path):
-    offset = timedelta(seconds=2.0)
-    records = [
-        ExifRecord(path=Path("a.jpg"), capture_time=NOW),
-        ExifRecord(path=Path("b.jpg"), capture_time=NOW + offset),
-        ExifRecord(path=Path("c.jpg"), capture_time=NOW + offset + timedelta(seconds=0.5)),
-    ]
-    clusters = group_burst_sequences(records, max_gap=timedelta(seconds=1.0))
-    assert len(clusters) == 2
-    assert {r.path.name for r in clusters[0]} == {"a.jpg"}
-    assert {r.path.name for r in clusters[1]} == {"b.jpg", "c.jpg"}
+def test_select_burst_winners_picks_highest_sharpness():
+    base = datetime(2024, 1, 1, 12, 0, 0)
+    a = ImagePair(raw_path=Path("a.NEF"), jpg_path=None, capture_time=base, sharpness=10.0)
+    b = ImagePair(raw_path=Path("b.NEF"), jpg_path=None, capture_time=base + timedelta(seconds=0.2), sharpness=50.0)
+    c = ImagePair(raw_path=Path("c.NEF"), jpg_path=None, capture_time=base + timedelta(seconds=0.4), sharpness=30.0)
+
+    groups = detect_bursts([a, b, c], threshold_seconds=2.0)
+    select_burst_winners(groups)
+
+    assert groups[0].winner is b
 
 
-def test_read_records_logs_unreadable_file(tmp_path, caplog):
-    bad = tmp_path / "nope.jpg"
-    bad.write_bytes(b"this is not an image")
-    with caplog.at_level("WARNING"):
-        records = read_records([bad])
-    assert any("Could not read EXIF" in r.message for r in caplog.records)
-    assert len(records) == 1
-    assert records[0].camera_model == "unreadable"
+def test_default_burst_threshold_is_two_seconds():
+    assert DEFAULT_BURST_SECONDS == 2.0

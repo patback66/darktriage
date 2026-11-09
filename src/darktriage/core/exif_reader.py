@@ -1,77 +1,57 @@
-"""EXIF parsing and burst sequence detection for DarkTriage.
-
-Reads camera metadata (capture time, lens, ISO, aperture, ...) from Pillow
-image objects and groups RAW/JPEG files into burst sequences based on their
-original capture timestamps.
-"""
+"""EXIF parsing, image-pair discovery, and burst detection for DarkTriage."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 from PIL import Image
-from PIL.ExifTags import IFD, TAGS
+
+from darktriage.core.metrics import compute_tenengrad, prepare_proxy
 
 logger = logging.getLogger(__name__)
 
-# TIFF/EXIF tag identifiers we care about.
-_TAG_DATETIME_ORIGINAL = 0x9003
-_TAG_DATETIME_DIGITIZED = 0x9004
-_TAG_OFFSET_TIME_ORIGINAL = 0x9011
-_TAG_CAMERA_MODEL = 0x0110
-_TAG_ISOSPEED = 0x8827
-_TAG_APERTURE = 0x829D
-_TAG_EXPOSURE_TIME = 0x829A
-_TAG_FOCAL_LENGTH = 0x920A
-_TAG_SEQUENCE_NUMBER = 0x0132
-_TAG_USER_COMMENT = 0x9286
+# RAW and JPEG extensions recognised when pairing .NEF files with previews.
+RAW_EXTENSIONS = {".nef", ".arw", ".cr2", ".cr3", ".raf", ".rw2", ".dng", ".orf"}
+JPG_EXTENSIONS = {".jpg", ".jpeg"}
 
-# Shots whose capture times differ by less than this are treated as one burst.
-# Raw clocks can stray by a few microseconds; the value is deliberately
-# tolerant and is tunable through the CLI/TUI.
-_DEFAULT_BURST_GAP = timedelta(seconds=1.0)
+# EXIF tag identifiers (TIFF/0th IFD + EXIF sub-IFD).
+_TAG_DATETIME_ORIGINAL = 0x9003
+_TAG_SUBSEC_ORIGINAL = 0x9291
+_TAG_OFFSET_TIME_ORIGINAL = 0x9011
+_TAG_DATETIME = 0x0132
+
+# Default burst-detection window in seconds.
+DEFAULT_BURST_SECONDS = 2.0
 
 
 class ExifParsingError(RuntimeError):
-    """Raised when an image cannot be decoded or carries no readable EXIF data."""
+    """Raised when an image carries no usable capture timestamp."""
 
 
-@dataclass(frozen=True)
-class ExifRecord:
-    """Metadata record for one file (used for scoring and burst grouping)."""
+@dataclass
+class ImagePair:
+    """A raw file plus its matched camera JPEG preview."""
 
-    path: Path
+    raw_path: Path
+    jpg_path: Optional[Path]
     capture_time: Optional[datetime] = None
-    camera_model: Optional[str] = None
-    iso: Optional[int] = None
-    aperture: Optional[float] = None
-    exposure_time: Optional[float] = None
-    focal_length: Optional[float] = None
-    sequence_number: Optional[int] = None
-    user_comment: Optional[str] = None
+    sharpness: Optional[float] = None
 
-    def to_dict(self) -> dict:
-        return {
-            "path": str(self.path),
-            "capture_time": self.capture_time.isoformat()
-            if self.capture_time
-            else None,
-            "camera_model": self.camera_model,
-            "iso": self.iso,
-            "aperture": self.aperture,
-            "exposure_time": self.exposure_time,
-            "focal_length": self.focal_length,
-            "sequence_number": self.sequence_number,
-            "user_comment": self.user_comment,
-        }
+
+@dataclass
+class BurstGroup:
+    """A cluster of consecutive shots taken within the burst threshold."""
+
+    index: int
+    images: List[ImagePair] = field(default_factory=list)
+    winner: Optional[ImagePair] = None
 
 
 def _decode_datetime(value) -> Optional[datetime]:
-    """Decode an EXIF date/time value to a naive UTC datetime."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -79,6 +59,8 @@ def _decode_datetime(value) -> Optional[datetime]:
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     text = str(value).strip()
+    if not text:
+        return None
     try:
         return datetime.fromisoformat(text)
     except ValueError:
@@ -91,151 +73,150 @@ def _decode_datetime(value) -> Optional[datetime]:
     return None
 
 
-def _read_ifd(image: Image.Image, ifd_tag: int) -> dict:
-    """Recursively decode an EXIF IFD into a nested {tag: value} dict."""
-    try:
-        exif = image.getexif()
-        ifd = exif.get_ifd(ifd_tag)
-    except Exception:
-        return {}
-    result: dict = {}
-    for tag_id, value in ifd.items():
-        name = TAGS.get(tag_id, hex(tag_id))
-        if isinstance(value, dict):
-            result[name] = _read_ifd(image, tag_id)
-        else:
-            result[name] = value
-    return result
+def _subsec_microseconds(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
+    if not digits:
+        return 0
+    # Normalise to exactly six digits (microseconds): pad short strings,
+    # truncate over-long strings.
+    digits = digits[:6].ljust(6, "0")
+    return int(digits)
 
 
-def parse_exif(image: Image.Image, *, read_interop: bool = True) -> dict:
-    """Return a flattened EXIF metadata dictionary for a ``PIL.Image``.
+def decode_capture_time(value, subsec=None) -> Optional[datetime]:
+    """Combine DateTimeOriginal with SubSecTimeOriginal into one datetime."""
+    base = _decode_datetime(value)
+    if base is None:
+        return None
+    return base.replace(microsecond=_subsec_microseconds(subsec))
 
-    The 0th IFD is always decoded (DateTimeOriginal, model, ...). When
-    ``read_interop`` is true, the Interoperability IFD is also decoded in
-    case the RAW data stores its capture time there.
+
+def read_capture_time(jpg_path: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal + sub-second from a JPEG preview.
+
+    Returns None for a missing/corrupt EXIF header (the caller decides how
+    to handle the pair) instead of raising.
     """
-    metadata: dict = {}
     try:
-        exif = image.getexif()
-    except Exception:
-        exif = None
+        with Image.open(jpg_path) as image:
+            exif = image.getexif()
+    except Exception as exc:  # noqa: BLE001 - corrupt header -> None
+        logger.warning("Cannot read EXIF from %s: %s", jpg_path, exc)
+        return None
 
-    if exif is not None:
-        tag_map = (
-            (_TAG_DATETIME_ORIGINAL, "datetime_original"),
-            (_TAG_DATETIME_DIGITIZED, "datetime_digital"),
-            (_TAG_OFFSET_TIME_ORIGINAL, "offset_time_original"),
-            (_TAG_CAMERA_MODEL, "camera_model"),
-            (_TAG_ISOSPEED, "iso"),
-            (_TAG_APERTURE, "aperture"),
-            (_TAG_EXPOSURE_TIME, "exposure_time"),
-            (_TAG_FOCAL_LENGTH, "focal_length"),
-            (_TAG_SEQUENCE_NUMBER, "sequence_number"),
-            (_TAG_USER_COMMENT, "user_comment"),
-        )
-        for tag_id, name in tag_map:
-            try:
-                value = exif.get(tag_id)
-            except Exception:
-                value = None
-            if value is not None:
-                if name == "camera_model" and isinstance(value, bytes):
-                    value = value.decode("utf-8", errors="replace")
-                metadata[name] = value
-
-        if read_interop:
-            try:
-                interoperability = exif.get_ifd(IFD.INTEROPERABILITY)
-                for tag_id, value in interoperability.items():
-                    if tag_id == 0x0002:  # InteroperabilityIndex
-                        metadata.setdefault(
-                            "interoperability", {}
-                        ).update({"interoperability_index": value})
-            except Exception:
-                pass
-    return metadata
+    dt = exif.get(_TAG_DATETIME_ORIGINAL) or exif.get(_TAG_DATETIME)
+    subsec = exif.get(_TAG_SUBSEC_ORIGINAL)
+    return decode_capture_time(dt, subsec)
 
 
-def read_records(paths: Iterable[Path]) -> List[ExifRecord]:
-    """Read EXIF metadata for every image path, returning one record each."""
-    records: List[ExifRecord] = []
-    for path in sorted(paths):
-        try:
-            with Image.open(path) as image:
-                image.load()
-                metadata = parse_exif(image)
-        except Exception as exc:
-            logger.warning("Could not read EXIF for %s: %s", path, exc)
-            records.append(
-                ExifRecord(
-                    path=path,
-                    camera_model="unreadable",
-                    user_comment=f"EXIF read failed: {exc}",
-                )
-            )
-            continue
+def discover_pairs(target_dir: Path) -> List[ImagePair]:
+    """Match .NEF/.RAW files with same-stem JPEG previews in a directory."""
+    directory = Path(target_dir)
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Not a directory: {directory}")
 
-        record = _record_from_metadata(path, metadata)
-        records.append(record)
-    return records
+    jpg_by_stem: Dict[str, Path] = {}
+    for path in directory.iterdir():
+        if path.is_file() and path.suffix.lower() in JPG_EXTENSIONS:
+            jpg_by_stem.setdefault(path.stem, path)
 
-
-def _record_from_metadata(path: Path, metadata: dict) -> ExifRecord:
-    capture_time = _decode_datetime(metadata.get("datetime_original"))
-    offset = _decode_datetime(metadata.get("offset_time_original"))
-
-    # Offset time is a local offset (e.g. "+02:00"); apply it to the
-    # unmodified capture time only when the original value is naive.
-    if offset is not None and capture_time is not None and capture_time.tzinfo is None:
-        capture_time = capture_time + offset
-
-    return ExifRecord(
-        path=path,
-        capture_time=capture_time,
-        camera_model=metadata.get("camera_model"),
-        iso=metadata.get("iso"),
-        aperture=metadata.get("aperture"),
-        exposure_time=metadata.get("exposure_time"),
-        focal_length=metadata.get("focal_length"),
-        sequence_number=metadata.get("sequence_number"),
-        user_comment=metadata.get("user_comment"),
+    raw_paths = sorted(
+        (
+            p
+            for p in directory.iterdir()
+            if p.is_file() and p.suffix.lower() in RAW_EXTENSIONS
+        ),
+        key=lambda p: p.name,
     )
 
+    pairs: List[ImagePair] = []
+    for raw in raw_paths:
+        jpg = jpg_by_stem.get(raw.stem)
+        if jpg is None:
+            logger.warning(
+                "No matching JPEG preview for %s (skipped for scoring)", raw
+            )
+        pairs.append(
+            ImagePair(
+                raw_path=raw,
+                jpg_path=jpg,
+                capture_time=read_capture_time(jpg) if jpg else None,
+            )
+        )
+    return pairs
 
-def _capture_time_key(record: ExifRecord):
-    return record.capture_time.timestamp() if record.capture_time else 0.0
 
-
-def group_burst_sequences(
-    records: Sequence[ExifRecord],
+def detect_bursts(
+    pairs: List[ImagePair],
     *,
-    max_gap: Optional[timedelta] = None,
-) -> List[List[ExifRecord]]:
-    """Group sorted records into burst sequences by capture-time gap.
+    threshold_seconds: float = DEFAULT_BURST_SECONDS,
+) -> List[BurstGroup]:
+    """Group capture-timed pairs into continuous-drive bursts.
 
-    Records are ordered by capture time; any two consecutive records whose
-    timestamps differ by ``max_gap`` seconds or less are placed in the same
-    burst.  The result is a list of clusters, sorted oldest to newest.
+    A pair with a missing/None capture time is excluded from grouping.
+    Consecutive timed shots whose timestamps differ by more than
+    ``threshold_seconds`` split into separate bursts.
     """
-    ordered = sorted(records, key=_capture_time_key)
-    gap = max_gap or _DEFAULT_BURST_GAP
-    clusters: List[List[ExifRecord]] = []
-    current: List[ExifRecord] = []
+    timed = [p for p in pairs if p.capture_time is not None]
+    ordered = sorted(timed, key=lambda p: p.capture_time)
+    gap = timedelta(seconds=threshold_seconds)
 
-    for record in ordered:
-        if (
-            current
-            and record.capture_time is not None
-            and current[-1].capture_time is not None
-        ):
-            gap_since_prev = record.capture_time - current[-1].capture_time
-            if gap_since_prev > gap:
-                clusters.append(current)
-                current = []
-        current.append(record)
-
+    groups: List[List[ImagePair]] = []
+    current: List[ImagePair] = []
+    for pair in ordered:
+        if current and (pair.capture_time - current[-1].capture_time) > gap:
+            groups.append(current)
+            current = []
+        current.append(pair)
     if current:
-        clusters.append(current)
+        groups.append(current)
 
-    return clusters
+    return [BurstGroup(index=i, images=list(g)) for i, g in enumerate(groups)]
+
+
+def _sharpness_of(pair: ImagePair) -> float:
+    if pair.sharpness is not None:
+        return pair.sharpness
+    if pair.jpg_path is None:
+        return 0.0
+    try:
+        return compute_tenengrad(prepare_proxy(pair.jpg_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Sharpness computation failed for %s: %s", pair.jpg_path, exc
+        )
+        return 0.0
+
+
+def select_burst_winners(groups: List[BurstGroup]) -> None:
+    """Flag the highest-Tenengrad frame in each burst as its winner."""
+    for group in groups:
+        best: Optional[ImagePair] = None
+        best_score = -1.0
+        for pair in group.images:
+            score = _sharpness_of(pair)
+            pair.sharpness = score
+            if score > best_score:
+                best_score = score
+                best = pair
+        group.winner = best
+@dataclass
+class Assessment:
+    """Complete per-image analysis: pairing, burst, metrics and decision."""
+
+    raw_path: Path
+    jpg_path: Optional[Path]
+    capture_time: Optional[datetime] = None
+    burst_index: Optional[int] = None
+    is_burst_winner: bool = False
+    sharpness: Optional[float] = None
+    composition_score: Optional[float] = None
+    mean_luminance: Optional[float] = None
+    clipped_highlight_pct: Optional[float] = None
+    rating: Optional[int] = None
+    label: Optional[str] = None
+    error: Optional[str] = None
