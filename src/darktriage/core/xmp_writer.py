@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 from darktriage.config import Tags, Thresholds
+from darktriage.core.autotag import select_new_tags
 
 logger = logging.getLogger(__name__)
 
@@ -188,12 +189,16 @@ class XmpWriter:
         create_backup: bool = True,
         verbose: bool = False,
         label_case: str = "title",
+        tag_merge: str = "union",
+        tag_aliases: Optional[dict] = None,
     ):
         self.exiftool = self._resolve(exiftool)
         self.dry_run = dry_run
         self.create_backup = create_backup
         self.verbose = verbose
         self.label_case = label_case
+        self.tag_merge = tag_merge
+        self.tag_aliases = tag_aliases
 
     @staticmethod
     def _resolve(exiftool: str) -> str:
@@ -275,8 +280,11 @@ class XmpWriter:
             )
 
         existing_subjects = read_sidecar_subjects(xmp_path)
-        new_subjects = tuple(
-            tag for tag in dict.fromkeys(tags) if tag and tag not in existing_subjects
+        new_subjects = select_new_tags(
+            existing_subjects,
+            tags,
+            aliases=self.tag_aliases,
+            mode=self.tag_merge,
         )
 
         args = self._build_args(rating, label, ev_offset)
@@ -334,10 +342,11 @@ class XmpWriter:
             if request.tags:
                 sidecar = xmp_sidecar_path(request.raw_path)
                 existing = read_sidecar_subjects(sidecar)
-                new_tags = tuple(
-                    tag
-                    for tag in dict.fromkeys(request.tags)
-                    if tag and tag not in existing
+                new_tags = select_new_tags(
+                    existing,
+                    request.tags,
+                    aliases=self.tag_aliases,
+                    mode=self.tag_merge,
                 )
                 if new_tags:
                     lines.extend(self._subject_args(new_tags, bool(existing)))

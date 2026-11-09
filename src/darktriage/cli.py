@@ -447,6 +447,8 @@ def cmd_analyze(args) -> int:
             create_backup=args.config.safety.create_backup,
             verbose=args.debug,
             label_case=args.config.darktable.label_case,
+            tag_merge=args.config.autotag.merge,
+            tag_aliases=args.config.autotag.aliases,
         )
     except ExifToolNotFoundError as exc:
         console.print(f"[yellow]{exc}[/yellow]")

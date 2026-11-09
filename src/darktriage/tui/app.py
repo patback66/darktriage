@@ -348,6 +348,8 @@ class DarkTriageApp(App):
                 label_case=self.config.darktable.label_case
                 if self.config
                 else "title",
+                tag_merge=self.config.autotag.merge if self.config else "union",
+                tag_aliases=self.config.autotag.aliases if self.config else None,
             )
         except ExifToolNotFoundError as exc:
             self._set_status(str(exc))
