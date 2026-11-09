@@ -54,7 +54,7 @@ from darktriage.core.metrics import (
     score_image,
     score_images,
 )
-from darktriage.core.previews import extract_previews
+from darktriage.core.previews import default_preview_cache_dir, extract_previews
 
 # --------------------------------------------------------------------------- #
 # Synthetic frame parameters
@@ -491,6 +491,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="persistent dir to cache extracted embedded previews across runs",
     )
     parser.add_argument(
+        "--bench-preview",
+        action="store_true",
+        help="phases 1-3 also score embedded previews (real-folder mode) so "
+        "the decode/scoring numbers reflect the --use-embedded-preview path",
+    )
+    parser.add_argument(
         "--keep", action="store_true", help="keep the generated temp directory"
     )
     parser.add_argument(
@@ -612,6 +618,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"\n  discover_pairs: {len(pairs)} RAW, {matched} matched JPEG")
             source_dir = args.dir
             has_raw_pairs = matched > 0
+            if args.bench_preview:
+                jpg_to_raw = {
+                    pair.jpg_path: pair.raw_path
+                    for pair in pairs
+                    if pair.jpg_path is not None
+                }
+                cache = args.preview_cache_dir or default_preview_cache_dir(args.dir)
+                sample = [(jpg, jpg_to_raw.get(jpg)) for jpg in jpg_paths]
+                sample_raws = [raw for _, raw in sample if raw is not None]
+                print(
+                    f"  extracting previews for {len(sample_raws)} sampled RAW "
+                    f"(bench-preview)..."
+                )
+                t0 = time.perf_counter()
+                sampled = extract_previews(
+                    sample_raws,
+                    cache,
+                    workers=args.workers,
+                    reuse_existing=True,
+                )
+                print(
+                    f"  sampled previews: {len(sampled)}/{len(sample_raws)} in "
+                    f"{time.perf_counter() - t0:.1f}s"
+                )
+                jpg_paths = [sampled.get(raw) or jpg for jpg, raw in sample]
             baseline_rss = peak_rss_mb()
         else:
             work_dir = Path(tempfile.mkdtemp(prefix="darktriage-bench-"))

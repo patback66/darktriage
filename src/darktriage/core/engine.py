@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -30,7 +28,7 @@ from darktriage.core.exif_reader import (
     discover_pairs,
 )
 from darktriage.core.metrics import Score, load_image_metadata, score_image
-from darktriage.core.previews import extract_previews
+from darktriage.core.previews import default_preview_cache_dir, extract_previews
 from darktriage.core.xmp_writer import derive_rating_and_label
 
 logger = logging.getLogger(__name__)
@@ -181,23 +179,24 @@ def score_pairs(
     return results
 
 
-def _build_image_map(
-    pairs: List[ImagePair], options: AnalysisOptions
-) -> Tuple[Dict[Path, Optional[Path]], Optional[Path]]:
+def build_image_map(
+    pairs: List[ImagePair], options: AnalysisOptions, directory: str
+) -> Dict[Path, Optional[Path]]:
     """Resolve image-per-raw, extracting embedded previews when requested.
 
-    Returns (image_map, temp_cache_dir_to_cleanup).
+    Uses ``options.preview_cache_dir`` if given, otherwise a stable per-folder
+    cache under ``$XDG_CACHE_HOME/darktriage/previews`` that stays warm across
+    runs.
     """
     if not options.use_embedded_preview:
-        return {p.raw_path: p.jpg_path for p in pairs}, None
+        return {p.raw_path: p.jpg_path for p in pairs}
 
     raws = [p.raw_path for p in pairs]
     cache_dir = (
         Path(options.preview_cache_dir)
         if options.preview_cache_dir
-        else Path(tempfile.mkdtemp(prefix="darktriage-previews-"))
+        else default_preview_cache_dir(directory)
     )
-    cleanup = None if options.preview_cache_dir else cache_dir
 
     previews = extract_previews(
         raws,
@@ -210,7 +209,7 @@ def _build_image_map(
     image_map: Dict[Path, Optional[Path]] = {}
     for pair in pairs:
         image_map[pair.raw_path] = previews.get(pair.raw_path) or pair.jpg_path
-    return image_map, cleanup
+    return image_map
 
 
 def analyze_directory(
@@ -233,16 +232,11 @@ def analyze_directory(
     )
     groups = detect_bursts(pairs, threshold_seconds=gap)
 
-    cleanup_dir: Optional[Path] = None
-    try:
-        if image_map is None:
-            image_map, cleanup_dir = _build_image_map(pairs, options)
-        score_by_path = score_pairs(
-            pairs, options, on_complete=on_complete, image_map=image_map
-        )
-    finally:
-        if cleanup_dir is not None:
-            shutil.rmtree(cleanup_dir, ignore_errors=True)
+    if image_map is None:
+        image_map = build_image_map(pairs, options, directory)
+    score_by_path = score_pairs(
+        pairs, options, on_complete=on_complete, image_map=image_map
+    )
 
     zero = Score(0.0, 0.0, 0.0, 0.0)
 
