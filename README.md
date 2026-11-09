@@ -289,6 +289,26 @@ The EV offset is written to `XMP-dc:Description` for reference inside Darktable.
 
 Tags are written to the XMP `dc:subject` keyword list **additively** — existing user keywords are preserved and DarkTriage never removes them. They show up in darktable's tag list once it re-reads the sidecar.
 
+### Merging with existing keywords
+
+`[autotag] merge` controls how auto-tags combine with keywords already in the sidecar:
+
+| `merge` | Behaviour |
+| --- | --- |
+| `union` (default) | Add auto tags not already covered — matched **case-insensitively and through the synonym table**, so `People`, `people`, or `persons` all satisfy `people`; your spelling is kept. |
+| `fill` | Only write auto tags when the sidecar has **no** keywords yet. |
+| `off` | Never write keywords (ratings/labels are unaffected). |
+
+Synonyms live under `[autotag.aliases]` (canonical → alternatives). Add your own so existing vocabulary is respected, e.g.:
+
+```toml
+[autotag.aliases]
+car = ["cars", "vehicle", "vehicles", "automobile"]
+people = ["person", "persons", "human", "humans", "folks"]
+```
+
+So if you already applied `cars` or `People`, autotagging won't duplicate them — and its synonyms (`persons`, `vehicles`, …) count as hits. Existing keywords are never modified or removed.
+
 ```bash
 darktriage analyze "$SHOOT" --use-embedded-preview --autotag --overwrite
 ```
@@ -333,6 +353,18 @@ label_case = "title"           # write xmp:Label as Red/Yellow/Green/Purple
 [sensor]
 iso_blur_above = 1600          # apply 3x3 noise pre-filter above this ISO
 region_center_fraction = 0.6   # central ROI used for focus/composition
+
+[autotag]
+merge = "union"                # union | fill | off (see Subject auto-tagging)
+
+[autotag.aliases]
+people = ["person", "persons", "human", "humans", "folk"]
+portrait = ["portraits", "headshot", "headshots"]
+group = ["groups", "crowd", "crowds"]
+landscape = ["landscapes", "scenery", "scenic", "vista", "vistas"]
+nature = ["outdoors", "wilderness", "forest", "forests"]
+night = ["nightscape", "nightscapes", "lowlight"]
+car = ["cars", "vehicle", "vehicles", "automobile", "automobiles"]
 ```
 
 Notes:

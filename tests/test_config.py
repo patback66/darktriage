@@ -54,3 +54,17 @@ def test_write_default_config_roundtrip(tmp_path):
     assert config.tags.exposure_warn == "yellow"
     assert config.darktable.config_dir == "~/.config/darktable"
     assert isinstance(config, Config)
+
+def test_load_config_autotag_merge_and_aliases(tmp_path):
+    from darktriage.config import DEFAULT_TAG_ALIASES
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[autotag]\nmerge = "fill"\n\n[autotag.aliases]\npeople = ["humans", "folks"]\n'
+    )
+    config = load_config(path)
+    assert config.autotag.merge == "fill"
+    assert config.autotag.aliases["people"] == ("humans", "folks")
+    # defaults for keys not overridden are preserved
+    assert "landscape" in config.autotag.aliases
+    assert config.autotag.aliases["landscape"] == DEFAULT_TAG_ALIASES["landscape"]

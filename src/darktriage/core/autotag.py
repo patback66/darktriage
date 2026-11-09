@@ -17,10 +17,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+from darktriage.config import DEFAULT_TAG_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -165,3 +167,58 @@ class SubjectTagger:
             face_count=len(faces), largest_face_ratio=largest, scene=scene
         )
         return SubjectTags(tags=tags, face_count=len(faces), scene=scene)
+
+
+def select_new_tags(
+    existing: "Sequence[str]",
+    auto: "Sequence[str]",
+    *,
+    aliases=None,
+    mode: str = "union",
+) -> Tuple[str, ...]:
+    """Return the auto tags to add, merging with existing keywords.
+
+    ``mode``:
+      * ``union`` (default) - add auto tags not already covered by an existing
+        keyword (case-insensitive, synonym-aware).
+      * ``fill`` - only add auto tags when the sidecar has no keywords yet.
+      * ``off`` - never add keywords.
+
+    Existing tags are matched case-insensitively and through the synonym table
+    (e.g. an existing ``persons`` satisfies the auto tag ``people``), so user
+    vocabulary is preserved and never duplicated.
+    """
+    normalised_mode = (mode or "union").strip().lower()
+    if normalised_mode in ("off", "none", "disabled"):
+        return ()
+
+    existing_tags = tuple(t.strip() for t in existing if t and t.strip())
+    if normalised_mode == "fill" and existing_tags:
+        return ()
+
+    alias_map = aliases if aliases is not None else DEFAULT_TAG_ALIASES
+    synonym_to_canonical = {}
+    for canonical, synonyms in alias_map.items():
+        canon = canonical.strip().lower()
+        synonym_to_canonical[canon] = canon
+        for synonym in synonyms:
+            synonym_to_canonical[synonym.strip().lower()] = canon
+
+    satisfied = set()
+    for tag in existing_tags:
+        low = tag.lower()
+        satisfied.add(low)
+        canonical = synonym_to_canonical.get(low)
+        if canonical:
+            satisfied.add(canonical)
+
+    new_tags = []
+    for tag in dict.fromkeys(auto):
+        if not tag:
+            continue
+        low = tag.strip().lower()
+        canonical = synonym_to_canonical.get(low, low)
+        if canonical in satisfied or low in satisfied:
+            continue
+        new_tags.append(tag)
+    return tuple(new_tags)
