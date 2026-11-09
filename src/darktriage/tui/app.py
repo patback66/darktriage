@@ -264,7 +264,10 @@ class DarkTriageApp(App):
             writer = XmpWriter(
                 create_backup=self.config.safety.create_backup
                 if self.config
-                else True
+                else True,
+                label_case=self.config.darktable.label_case
+                if self.config
+                else "title",
             )
         except ExifToolNotFoundError as exc:
             self._set_status(str(exc))
