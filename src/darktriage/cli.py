@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from rich.console import Console
 from rich.progress import (
@@ -147,8 +147,7 @@ def _analyze_directory(
     threshold_seconds: Optional[float] = None,
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
     workers: Optional[int] = None,
-    progress: Optional[Progress] = None,
-    score_task_id: Optional[int] = None,
+    on_complete: Optional[Callable[[], None]] = None,
 ) -> List[Assessment]:
     """Score every .NEF/.JPG pair and return per-file assessments.
 
@@ -156,8 +155,8 @@ def _analyze_directory(
     scoring pipeline (noise filtering, auto-rotation, central-region masking)
     so results are camera-configurable rather than hardcoded.
 
-    If ``progress`` and ``score_task_id`` are supplied, the scoring progress
-    bar is advanced as each file finishes.
+    ``on_complete``, if given, is called once per scored JPEG (useful for
+    driving a progress bar).
     """
     pairs = discover_pairs(directory)
     gap = (
@@ -174,16 +173,12 @@ def _analyze_directory(
         meta = load_image_metadata(pair.jpg_path)
         items.append((pair.jpg_path, meta.iso, meta.orientation))
 
-    def _advance_scoring() -> None:
-        if progress is not None and score_task_id is not None:
-            progress.update(score_task_id, advance=1)
-
     scores = score_images(
         items,
         max_dim=max_dim,
         center_fraction=config.sensor.region_center_fraction,
         workers=workers,
-        on_complete=_advance_scoring,
+        on_complete=on_complete,
     )
     score_by_path = {p.jpg_path: s for p, s in zip(jpg_pairs, scores)}
 
@@ -291,14 +286,16 @@ def cmd_analyze(args) -> int:
     ) as progress:
         score_task = progress.add_task("Scoring images", total=jpg_count)
 
+        def _advance_scoring() -> None:
+            progress.update(score_task, advance=1)
+
         assessments = _analyze_directory(
             args.dir,
             args.config,
             threshold_seconds=args.burst_threshold,
             max_dim=args.max_dim,
             workers=getattr(args, "threads", None),
-            progress=progress,
-            score_task_id=score_task,
+            on_complete=_advance_scoring,
         )
         progress.update(score_task, completed=jpg_count)
         progress.stop_task(score_task)
@@ -364,17 +361,16 @@ def cmd_analyze(args) -> int:
     return 0
 
 def cmd_tui(args) -> int:
-    assessments = _analyze_directory(
-        args.dir,
-        args.config,
-        threshold_seconds=args.burst_threshold,
-        max_dim=args.max_dim,
-        workers=getattr(args, "threads", None),
-    )
     try:
         from darktriage.tui.app import DarkTriageApp
 
-        DarkTriageApp(assessments=assessments, directory=args.dir, config=args.config).run()
+        DarkTriageApp(
+            directory=args.dir,
+            config=args.config,
+            threshold=args.burst_threshold,
+            max_dim=args.max_dim,
+            workers=getattr(args, "threads", None),
+        ).run()
     except ImportError as exc:
         console.print(f"[red]Textual is required for the TUI: {exc}[/red]")
         return 1
