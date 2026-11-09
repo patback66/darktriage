@@ -69,6 +69,7 @@ class DarkTriageApp(App):
         workers: Optional[int] = None,
         use_embedded_preview: bool = False,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        preview_cache_dir: Optional[str] = None,
     ):
         super().__init__()
         self.assessments: List[Assessment] = list(assessments or [])
@@ -79,6 +80,7 @@ class DarkTriageApp(App):
         self._scoring_workers = workers
         self.use_embedded_preview = use_embedded_preview
         self.chunk_size = chunk_size
+        self.preview_cache_dir = preview_cache_dir
         self.selected: Optional[Assessment] = None
         self._commit_in_progress = False
         self._analysis_ready = False
@@ -164,6 +166,7 @@ class DarkTriageApp(App):
                 on_complete=advance,
                 use_embedded_preview=self.use_embedded_preview,
                 chunk_size=self.chunk_size,
+                preview_cache_dir=self.preview_cache_dir,
                 pairs=pairs,
             )
             self.call_from_thread(self._analysis_done, assessments)

@@ -199,10 +199,14 @@ def _build_image_map(
     )
     cleanup = None if options.preview_cache_dir else cache_dir
 
-    previews = extract_previews(raws, cache_dir, verbose=False)
-    logger.info(
-        "embedded previews: %d/%d extracted from RAW", len(previews), len(raws)
+    previews = extract_previews(
+        raws,
+        cache_dir,
+        workers=max(1, options.workers or 1),
+        reuse_existing=True,
+        verbose=False,
     )
+    logger.info("embedded previews: %d/%d available", len(previews), len(raws))
     image_map: Dict[Path, Optional[Path]] = {}
     for pair in pairs:
         image_map[pair.raw_path] = previews.get(pair.raw_path) or pair.jpg_path

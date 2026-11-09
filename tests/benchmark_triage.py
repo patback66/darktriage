@@ -54,6 +54,7 @@ from darktriage.core.metrics import (
     score_image,
     score_images,
 )
+from darktriage.core.previews import extract_previews
 
 # --------------------------------------------------------------------------- #
 # Synthetic frame parameters
@@ -318,19 +319,26 @@ def bench_engine(
     max_dim: int,
     workers: int,
     use_embedded_preview: bool = False,
+    image_map: Optional[dict] = None,
 ) -> EngineStats:
-    """Time a single full ``analyze_directory()`` pass (pairs + bursts + pool)."""
+    """Time a single full ``analyze_directory()`` pass (pairs + bursts + pool).
+
+    When ``image_map`` is supplied the (expensive) preview extraction is not
+    counted here -- only scoring.
+    """
     config = load_config()
     options = AnalysisOptions(
         max_dim=max_dim,
         workers=workers,
-        use_embedded_preview=use_embedded_preview,
+        use_embedded_preview=use_embedded_preview and image_map is None,
     )
     pair_count = len(discover_pairs(directory))
 
     gc.collect()
     start = time.perf_counter()
-    assessments = analyze_directory(str(directory), config, options)
+    assessments = analyze_directory(
+        str(directory), config, options, image_map=image_map
+    )
     seconds = time.perf_counter() - start
 
     return EngineStats(
@@ -473,6 +481,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="engine phase scores each RAW's embedded JPEG preview instead of "
         "the Fine JPEG (much faster; needs exiftool)",
+    )
+    parser.add_argument(
+        "--preview-cache-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="persistent dir to cache extracted embedded previews across runs",
     )
     parser.add_argument(
         "--keep", action="store_true", help="keep the generated temp directory"
@@ -676,21 +691,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"\n[4/4] parallel engine with {args.workers} {workers_label}"
         )
         if has_raw_pairs:
+            image_map = None
+            preview_cleanup = None
+            if args.use_embedded_preview:
+                raws = [p.raw_path for p in pairs if p.jpg_path is not None]
+                if args.preview_cache_dir:
+                    cache_dir = Path(args.preview_cache_dir)
+                else:
+                    cache_dir = Path(
+                        tempfile.mkdtemp(prefix="darktriage-previews-")
+                    )
+                    preview_cleanup = cache_dir
+                print(
+                    f"      extracting embedded previews for {len(raws)} RAW "
+                    f"with {args.workers} workers..."
+                )
+                t0 = time.perf_counter()
+                previews = extract_previews(
+                    raws, cache_dir, workers=args.workers, reuse_existing=True
+                )
+                extract_s = time.perf_counter() - t0
+                have = len(previews)
+                print(
+                    f"      embedded previews: {have}/{len(raws)} in "
+                    f"{extract_s:.1f}s ({have / max(1, len(raws)) * 100:.0f}%)"
+                )
+                image_map = {
+                    p.raw_path: (previews.get(p.raw_path) or p.jpg_path)
+                    for p in pairs
+                }
+
             engine = bench_engine(
-                source_dir,
-                args.max_dim,
-                args.workers,
-                use_embedded_preview=args.use_embedded_preview,
+                source_dir, args.max_dim, args.workers, image_map=image_map
             )
             print(f"      {rate_line(engine.timing)}")
             print(
                 f"      pairs {engine.pair_count} | burst winners"
                 f" {engine.burst_winners} | rated {engine.rated}"
             )
-            print(
-                "      (whole-folder analyze_directory: pairing + EXIF + pool;"
-                " this is the end-to-end number)"
-            )
+            if args.use_embedded_preview:
+                print(
+                    "      (scoring time excludes the one-time preview "
+                    "extraction printed above)"
+                )
+            else:
+                print(
+                    "      (whole-folder analyze_directory: pairing + EXIF + "
+                    "pool; this is the end-to-end number)"
+                )
+            if preview_cleanup is not None:
+                shutil.rmtree(preview_cleanup, ignore_errors=True)
         else:
             engine = bench_parallel_scoring(jpg_paths, args.max_dim, args.workers)
             print(f"      {rate_line(engine.timing)}")
