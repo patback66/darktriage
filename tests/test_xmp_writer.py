@@ -187,7 +187,8 @@ def test_write_batch_single_invocation(tmp_path):
     assert command[1] == "-@"
 
     lines = writer.build_argfile_lines(requests)
-    assert lines.count("-execute") == 2
+    assert lines.count("-execute") == 1  # separator between the two groups only
+    assert lines[-1].endswith("B.NEF.xmp")  # no trailing -execute
     assert "-XMP-xmp:Rating=5" in lines
     assert "-XMP-xmp:Rating=4" in lines
     assert any(line.endswith("A.NEF.xmp") for line in lines)

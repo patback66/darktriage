@@ -147,3 +147,19 @@ def test_apply_region_mask_weights_center():
     # centre keeps full weight; far corners are suppressed
     assert weighted[32, 32] == pytest.approx(200.0)
     assert weighted[0, 0] < weighted[32, 32]
+
+def test_score_image_early_exit_on_blur(tmp_path):
+    path = tmp_path / "flat.jpg"
+    Image.fromarray(np.full((240, 240), 128, dtype=np.uint8)).save(path)
+    score = score_image(path, max_dim=256, blur_threshold=150.0)
+    assert score.early_exit is True
+    assert score.composition_score == 0.0
+    assert score.clipped_highlight_pct == 0.0
+
+
+def test_score_image_no_early_exit_when_sharp(tmp_path):
+    path = tmp_path / "sharp.jpg"
+    Image.fromarray(_sharp_pattern()).save(path)
+    score = score_image(path, max_dim=256, blur_threshold=1.0)
+    assert score.early_exit is False
+    assert score.sharpness > 1.0

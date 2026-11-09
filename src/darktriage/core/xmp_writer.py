@@ -262,14 +262,21 @@ class XmpWriter:
         )
 
     def build_argfile_lines(self, requests: Iterable[SidecarRequest]) -> List[str]:
-        """Build ExifTool -@ argfile lines for a batch of sidecar writes."""
+        """Build ExifTool -@ argfile lines for a batch of sidecar writes.
+
+        ``-execute`` separates independent command groups and is emitted only
+        *between* groups (a trailing ``-execute`` would create an empty final
+        command that ExifTool rejects with "Nothing to do").
+        """
+        requests = list(requests)
         lines: List[str] = []
-        for request in requests:
+        for index, request in enumerate(requests):
+            if index > 0:
+                lines.append("-execute")
             lines.extend(
                 self._build_args(request.rating, request.label, request.ev_offset)
             )
             lines.append(str(xmp_sidecar_path(request.raw_path)))
-            lines.append("-execute")
         return lines
 
     def write_batch(

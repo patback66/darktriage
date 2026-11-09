@@ -63,9 +63,13 @@ class ImageMetadata:
 
 
 def load_image_metadata(jpg_path: Union[str, Path]) -> ImageMetadata:
-    """Read ISO and EXIF orientation from a JPEG preview."""
+    """Read ISO and EXIF orientation from a JPEG preview.
+
+    Only the EXIF header is read (Pillow parses the APP1 segment lazily);
+    ``Image.load()`` is deliberately NOT called so we never full-decode the
+    36 MP frame just to read metadata.
+    """
     with Image.open(jpg_path) as image:
-        image.load()
         exif = image.getexif()
         iso = None
         iso_value = exif.get(0x8827)  # ISOSpeedRatings
@@ -115,74 +119,92 @@ except Exception:  # noqa: BLE001 - optional dependency
 
 
 def _choose_reduction(long_edge: int, max_dim: int) -> int:
-    """Pick the DCT reduction factor whose result is <= max_dim (1, 2, 4, 8)."""
-    if long_edge <= max_dim:
-        return 1
-    ratio = long_edge / float(max_dim)
-    for factor in (2, 4, 8):
-        if ratio <= factor:
-            return factor
-    return 8
+    """Pick the DCT reduction (1/2/4/8) whose result is closest to max_dim.
+
+    Choosing the closest result (rather than the smallest) keeps small images
+    at full resolution while decoding 36 MP frames at 1/4 scale, and avoids the
+    discontinuity where a 1 px size change would halve the proxy.
+    """
+    return min((1, 2, 4, 8), key=lambda f: abs(long_edge / float(f) - max_dim))
+
+
+def _target_long_edge(long_edge: int, max_dim: int) -> int:
+    """Canonical proxy long edge (never upscales past the source)."""
+    return min(long_edge, max_dim)
+
+
+def _resize_long_edge(array: np.ndarray, target: int) -> np.ndarray:
+    """Resize so the long edge equals ``target`` (down- or up-scaling)."""
+    long_edge = max(array.shape[:2])
+    if long_edge == target or long_edge == 0:
+        return array
+    scale = target / float(long_edge)
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(
+        array, None, fx=scale, fy=scale, interpolation=interpolation
+    )
 
 
 def _decode_with_turbojpeg(data: bytes, reduction: int) -> np.ndarray:
     """Decode to grayscale via PyTurboJPEG at the requested reduction."""
     scaling = {2: 0.5, 4: 0.25, 8: 0.125}.get(reduction, 1.0)
-    array = _TURBOJPEG.decode(
-        data, pixel_format=TJPF_GRAY, scaling_factor=scaling
+    array = np.asarray(
+        _TURBOJPEG.decode(data, pixel_format=TJPF_GRAY, scaling_factor=scaling),
+        dtype=np.uint8,
     )
-    return np.asarray(array, dtype=np.uint8)
+    if array.ndim != 2:
+        raise ValueError("TurboJPEG did not return a 2-D grayscale array")
+    return array
 
 
 def _decode_grayscale_fast(
     jpg_path: Union[str, Path], max_dim: int
 ) -> np.ndarray:
-    """Decode a JPEG directly to a downscaled grayscale array.
+    """Decode a JPEG directly to a grayscale array at the canonical proxy size.
 
     Uses PyTurboJPEG when available, otherwise OpenCV's reduced-scale
-    ``IMREAD_REDUCED_GRAYSCALE_*`` flags, falling back to Pillow.
+    ``IMREAD_REDUCED_GRAYSCALE_*`` flags, falling back to Pillow on failure.
+    The returned long edge always equals ``min(source_long_edge, max_dim)`` so
+    the fast and Pillow paths produce identical proxy dimensions.
     """
     data = Path(jpg_path).read_bytes()
 
     # Header-only dimensions (no pixel decode) to pick the reduction factor.
     with Image.open(jpg_path) as image:
         width, height = image.size
-    reduction = _choose_reduction(max(width, height), max_dim)
+    source_long_edge = max(width, height)
+    reduction = _choose_reduction(source_long_edge, max_dim)
+    target = _target_long_edge(source_long_edge, max_dim)
 
-    array: Optional[np.ndarray]
+    array: Optional[np.ndarray] = None
     if _TURBOJPEG is not None:
         try:
-            return _decode_with_turbojpeg(data, reduction)
+            array = _decode_with_turbojpeg(data, reduction)
         except Exception:  # noqa: BLE001 - fall through to OpenCV
-            pass
+            array = None
 
-    array = cv2.imdecode(
-        np.frombuffer(data, dtype=np.uint8), _CV_REDUCED_FLAGS[reduction]
-    )
     if array is None:
-        raise ValueError(f"OpenCV could not decode JPEG: {jpg_path}")
-    if array.ndim == 3:
-        array = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
-    if max(array.shape) > max_dim:
-        scale = max_dim / float(max(array.shape))
-        array = cv2.resize(
-            array,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA,
+        array = cv2.imdecode(
+            np.frombuffer(data, dtype=np.uint8), _CV_REDUCED_FLAGS[reduction]
         )
+        if array is None:
+            raise ValueError(f"OpenCV could not decode JPEG: {jpg_path}")
+        if array.ndim == 3:
+            array = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+
+    array = _resize_long_edge(array, target)
     return array.astype(np.uint8, copy=False)
 
 
 def prepare_proxy(
     jpg_path: Union[str, Path], max_dim: int = DEFAULT_PROXY_MAX_DIM
 ) -> np.ndarray:
-    """Fast-load a camera JPEG as a downscaled single-channel grayscale array.
+    """Fast-load a camera JPEG as a grayscale array at the canonical proxy size.
 
     Decodes at 1/2, 1/4 or 1/8 scale directly in the DCT domain (PyTurboJPEG /
     OpenCV reduced flags) to avoid full 36 MP decoding, falling back to a
-    Pillow Lanczos resize if the fast path fails.
+    Pillow Lanczos resize if the fast path fails.  Both paths yield the same
+    long edge (``min(source_long_edge, max_dim)``) so metrics are comparable.
     """
     try:
         return _decode_grayscale_fast(jpg_path, max_dim)
@@ -193,8 +215,9 @@ def prepare_proxy(
         image = image.convert("RGB")
         width, height = image.size
         long_edge = max(width, height)
-        if long_edge > max_dim:
-            scale = max_dim / float(long_edge)
+        target = _target_long_edge(long_edge, max_dim)
+        if long_edge != target and long_edge > 0:
+            scale = target / float(long_edge)
             new_size = (
                 max(1, int(round(width * scale))),
                 max(1, int(round(height * scale))),
@@ -204,7 +227,12 @@ def prepare_proxy(
 
 
 def central_roi(gray_img: np.ndarray, fraction: float = 0.6) -> np.ndarray:
-    """Return the central ``fraction`` region-of-interest crop."""
+    """Return the central ``fraction`` region-of-interest crop.
+
+    ``fraction`` is clamped to [0.05, 1.0] to avoid degenerate/nonsensical
+    crops from bad configuration.
+    """
+    fraction = min(1.0, max(0.05, float(fraction)))
     height, width = gray_img.shape[:2]
     crop_h = max(1, int(round(height * fraction)))
     crop_w = max(1, int(round(width * fraction)))
@@ -350,13 +378,19 @@ def score_image(
     sharpness = compute_tenengrad(roi)
 
     if sharpness < blur_threshold:
-        # Early exit: cheap mean luminance only, skip histogram + composition.
-        mean_luminance = float(roi.mean())
+        # Early exit: skip the composition grid, but still compute exposure on
+        # the full frame so clipping/EV stay correct for soft frames.
+        mean_luminance = float(gray.mean())
+        clipped = (
+            float(np.count_nonzero(gray > HIGHLIGHT_LUMINANCE))
+            / float(max(1, gray.size))
+            * 100.0
+        )
         return Score(
             sharpness=sharpness,
             composition_score=0.0,
             mean_luminance=mean_luminance,
-            clipped_highlight_pct=0.0,
+            clipped_highlight_pct=clipped,
             ev_offset=compute_ev_offset(mean_luminance),
             early_exit=True,
         )

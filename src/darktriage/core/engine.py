@@ -11,10 +11,11 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from darktriage.config import Config
 from darktriage.core.exif_reader import (
@@ -49,6 +50,12 @@ Payload = Tuple[str, Optional[int], int, AnalysisOptions]
 
 def chunked(iterable, size: int) -> Iterator[list]:
     """Yield lists of at most ``size`` items from an iterable (bounded memory)."""
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = DEFAULT_CHUNK_SIZE
+    if size < 1:
+        size = DEFAULT_CHUNK_SIZE
     iterator = iter(iterable)
     while True:
         chunk = list(islice(iterator, size))
@@ -83,8 +90,9 @@ def score_pairs(
 ) -> Dict[Path, Score]:
     """Score every pair's JPEG preview, in bounded parallel chunks.
 
-    Returns a mapping of jpg path -> Score.  Failures are captured as an
-    error Score rather than aborting the batch.
+    Returns a mapping of jpg path -> Score.  Per-file failures are captured as
+    an error Score; a crashed worker pool degrades to serial scoring for the
+    remaining files rather than aborting the whole batch.
     """
     scorable = [p for p in pairs if p.jpg_path is not None]
     if not scorable:
@@ -98,31 +106,49 @@ def score_pairs(
         if on_complete:
             on_complete()
 
+    def _error(pair: ImagePair, exc: Exception) -> None:
+        _record(pair, Score(0.0, 0.0, 0.0, 0.0, error=str(exc)))
+
+    def _serial(pending: List[ImagePair]) -> None:
+        for pair in pending:
+            if pair.jpg_path in results:
+                continue
+            try:
+                _record(pair, _score_payload(_build_payload(pair, options)))
+            except Exception as exc:  # noqa: BLE001
+                _error(pair, exc)
+
     if worker_count == 1:
-        for chunk in chunked(scorable, options.chunk_size):
-            for pair in chunk:
-                try:
-                    _record(pair, _score_payload(_build_payload(pair, options)))
-                except Exception as exc:  # noqa: BLE001
-                    _record(pair, Score(0.0, 0.0, 0.0, 0.0, error=str(exc)))
+        _serial(scorable)
         return results
 
-    with ProcessPoolExecutor(max_workers=worker_count) as pool:
-        for chunk in chunked(scorable, options.chunk_size):
-            futures = {}
-            for pair in chunk:
-                try:
-                    payload = _build_payload(pair, options)
-                except Exception as exc:  # noqa: BLE001
-                    _record(pair, Score(0.0, 0.0, 0.0, 0.0, error=str(exc)))
-                    continue
-                futures[pool.submit(_score_payload, payload)] = pair
-            for future in as_completed(futures):
-                pair = futures[future]
-                try:
-                    _record(pair, future.result())
-                except Exception as exc:  # noqa: BLE001
-                    _record(pair, Score(0.0, 0.0, 0.0, 0.0, error=str(exc)))
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            for chunk in chunked(scorable, options.chunk_size):
+                futures = {}
+                for pair in chunk:
+                    if pair.jpg_path in results:
+                        continue
+                    try:
+                        payload = _build_payload(pair, options)
+                    except Exception as exc:  # noqa: BLE001
+                        _error(pair, exc)
+                        continue
+                    futures[pool.submit(_score_payload, payload)] = pair
+                for future in as_completed(futures):
+                    pair = futures[future]
+                    try:
+                        _record(pair, future.result())
+                    except Exception as exc:  # noqa: BLE001
+                        _error(pair, exc)
+    except BrokenProcessPool:
+        logger.warning(
+            "Scoring worker pool terminated; falling back to serial scoring "
+            "for %d remaining file(s)",
+            len([p for p in scorable if p.jpg_path not in results]),
+        )
+        _serial(scorable)
+
     return results
 
 
@@ -151,11 +177,13 @@ def analyze_directory(
             return 0.0
         return score_by_path.get(pair.jpg_path, zero).sharpness
 
-    winner_by_path: Dict[Path, bool] = {}
+    # Winners are keyed by raw path so two raws sharing one preview are not
+    # both flagged as the burst winner.
+    winner_raw: Set[Path] = set()
     for group in groups:
         best = max(group.images, key=sharpness_of, default=None)
-        if best is not None and best.jpg_path is not None:
-            winner_by_path[best.jpg_path] = True
+        if best is not None:
+            winner_raw.add(best.raw_path)
 
     burst_index_by_path: Dict[Path, int] = {}
     for gi, group in enumerate(groups):
@@ -169,7 +197,7 @@ def analyze_directory(
             jpg_path=pair.jpg_path,
             capture_time=pair.capture_time,
             burst_index=burst_index_by_path.get(pair.raw_path),
-            is_burst_winner=pair.jpg_path in winner_by_path,
+            is_burst_winner=pair.raw_path in winner_raw,
         )
         if pair.jpg_path is None:
             assessment.error = "no matching JPEG preview"

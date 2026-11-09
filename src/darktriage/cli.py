@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from rich.console import Console
 from rich.progress import (
