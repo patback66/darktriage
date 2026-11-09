@@ -295,3 +295,60 @@ def analyze_directory(
         assessments.append(assessment)
 
     return assessments
+
+
+@dataclass(frozen=True)
+class RatingSummary:
+    """Aggregate rating/label distribution over a batch."""
+
+    total: int
+    rated: int
+    unscoreable: int
+    soft: int
+    by_rating: Dict[int, int]
+    by_label: Dict[str, int]
+
+
+def summarize_assessments(assessments: List[Assessment]) -> RatingSummary:
+    """Count ratings and labels across a set of assessments."""
+    by_rating: Dict[int, int] = {rating: 0 for rating in (1, 2, 3, 4, 5)}
+    by_label: Dict[str, int] = {}
+    rated = 0
+    unscoreable = 0
+    for assessment in assessments:
+        if assessment.rating is None:
+            unscoreable += 1
+            continue
+        rated += 1
+        by_rating[assessment.rating] = by_rating.get(assessment.rating, 0) + 1
+        label = assessment.label or "none"
+        by_label[label] = by_label.get(label, 0) + 1
+    return RatingSummary(
+        total=len(assessments),
+        rated=rated,
+        unscoreable=unscoreable,
+        soft=by_rating.get(1, 0),
+        by_rating=by_rating,
+        by_label=by_label,
+    )
+
+
+def format_rating_histogram(summary: RatingSummary, *, percent: bool = False) -> str:
+    """Render ``1★ 235 · 3★ 940 · ...`` (optionally with percentages)."""
+    total = summary.total or 1
+    parts = []
+    for rating in (1, 2, 3, 4, 5):
+        count = summary.by_rating.get(rating, 0)
+        if percent:
+            parts.append(f"{rating}★ {count} ({count / total * 100:.0f}%)")
+        else:
+            parts.append(f"{rating}★ {count}")
+    return " · ".join(parts)
+
+
+def format_label_histogram(summary: RatingSummary) -> str:
+    """Render ``red 12 · yellow 30 · green 400 · purple 6 · none 20``."""
+    order = ["red", "yellow", "green", "purple", "none"]
+    keys = [name for name in order if name in summary.by_label]
+    keys += [name for name in summary.by_label if name not in order]
+    return " · ".join(f"{name} {summary.by_label[name]}" for name in keys)

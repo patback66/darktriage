@@ -163,3 +163,13 @@ def test_score_image_no_early_exit_when_sharp(tmp_path):
     score = score_image(path, max_dim=256, blur_threshold=1.0)
     assert score.early_exit is False
     assert score.sharpness > 1.0
+
+
+def test_composition_ratio_is_clamped():
+    from darktriage.core.metrics import MAX_COMPOSITION_RATIO
+
+    arr = np.zeros((300, 300), dtype=np.uint8)
+    arr[:, :2] = 255  # edge energy only at the far left; centre cell empty
+    score = compute_composition_score(arr)
+    assert score == pytest.approx(MAX_COMPOSITION_RATIO)
+    assert score <= MAX_COMPOSITION_RATIO

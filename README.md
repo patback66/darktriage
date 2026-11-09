@@ -110,6 +110,8 @@ darktriage --threads 8 analyze "/path/to/shoot" \
   --use-embedded-preview --overwrite
 ```
 
+After the table it prints a one-line **rating/label histogram** (e.g. `1★ 15% · 3★ 60% · 4★ 24% · 5★ 1%`, plus label counts) so you can sanity-check the calibrated mix at a glance.
+
 ### `darktriage tui <dir>`
 
 Launches the interactive Textual dashboard. Pairing/EXIF/scoring run in a background worker so the UI stays responsive; a progress bar shows scoring, the file list and metric breakdown populate when analysis finishes, and **Commit XMP sidecars** writes everything at once (respecting the non-destructive rules).
@@ -121,7 +123,7 @@ Launches the interactive Textual dashboard. Pairing/EXIF/scoring run in a backgr
 | `--use-embedded-preview` | Score embedded RAW previews instead of Fine JPEGs. |
 | `--chunk-size N` | Files per parallel work chunk. |
 
-Press `q` to quit.
+Press `q` to quit. After analysis the dashboard shows the same one-line rating/label histogram, and the selected file's full metric breakdown.
 
 ### `darktriage export <dir>`
 
@@ -168,6 +170,8 @@ darktriage calibrate "/path/to/shoot" --sample 500 --use-embedded-preview --writ
 
 > Calibrate on the **same source you analyse with** (Fine JPEG vs `--use-embedded-preview`): the embedded preview has a different resolution/compression, so its Tenengrad scale differs.
 
+It also reports how many sampled frames scored **zero sharpness** (a sign of blank/failed preview extracts) so you can spot data problems before trusting the bands.
+
 ### `darktriage previews extract <dir>`
 
 Warms the embedded-preview cache ahead of time so the first `analyze`/TUI run is already fast. Prints how many previews are available and where the cache lives.
@@ -186,7 +190,7 @@ For each `.NEF`/`.JPG` pair, `analyze` runs this pipeline:
 1. **Decode** the camera preview to grayscale at a reduced DCT scale (fast path), then **auto-rotate** it using the EXIF Orientation tag.
 2. If **ISO > `sensor.iso_blur_above`** (default 1600), apply a 3×3 Gaussian noise pre-filter.
 3. Compute **Tenengrad** (Sobel `Gx²+Gy²`) on the central `sensor.region_center_fraction` region (default 60%). If it is below `thresholds.tenengrad_blur`, the frame is flagged **soft/blur and exits early** (no composition/clipping work).
-4. Otherwise compute **composition** (off-centre ÷ centre grid energy) and **exposure** (mean luminance + clipped-highlight %), and derive a recommended **EV offset** `clamp(log2(128/mean), -2, +2)`.
+4. Otherwise compute **composition** (off-centre ÷ centre grid energy, clamped at 100 for stability) and **exposure** (mean luminance + clipped-highlight %), and derive a recommended **EV offset** `clamp(log2(128/mean), -2, +2)`.
 5. **Burst grouping**: shots within `thresholds.burst_interval_sec` are clustered; for each **multi-frame** burst the sharpest frame is the **winner** and gets +1 star (lone frames are not "winners").
 
 Ratings and labels are then derived from the configured thresholds:

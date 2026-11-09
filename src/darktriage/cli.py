@@ -40,6 +40,9 @@ from darktriage.core.engine import (
     DEFAULT_CHUNK_SIZE,
     AnalysisOptions,
     analyze_directory,
+    format_label_histogram,
+    format_rating_histogram,
+    summarize_assessments,
 )
 from darktriage.core.exif_reader import Assessment, ImagePair, discover_pairs
 from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM
@@ -299,6 +302,20 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
     console.print(table)
 
 
+def _render_rating_summary(assessments: List[Assessment]) -> None:
+    """Print a one-line rating histogram and label counts for a batch."""
+    summary = summarize_assessments(assessments)
+    if summary.total == 0:
+        return
+    console.print(
+        f"  ratings: {format_rating_histogram(summary, percent=True)}"
+    )
+    if summary.by_label:
+        console.print(f"  labels:  {format_label_histogram(summary)}")
+    if summary.unscoreable:
+        console.print(f"  [yellow]unscoreable: {summary.unscoreable}[/yellow]")
+
+
 def cmd_analyze(args) -> int:
     pairs = discover_pairs(args.dir)
     use_embedded = getattr(args, "use_embedded_preview", False)
@@ -338,6 +355,7 @@ def cmd_analyze(args) -> int:
         progress.refresh()
 
     _render_assessment_table(assessments, f"DarkTriage analysis: {args.dir}")
+    _render_rating_summary(assessments)
 
     if args.dry_run or args.config.safety.dry_run:
         console.print("[dim]dry-run: no XMP sidecars written[/dim]")
@@ -518,6 +536,8 @@ def cmd_calibrate(args) -> int:
         console.print("[yellow]no scorable images for calibration[/yellow]")
         return 1
 
+    zero_sharpness = sum(1 for s in scores if s.sharpness <= 0.0)
+
     sharpness = summarise([s.sharpness for s in scores])
     composition = summarise([s.composition_score for s in scores])
     clipping = summarise([s.clipped_highlight_pct / 100.0 for s in scores])
@@ -536,6 +556,12 @@ def cmd_calibrate(args) -> int:
         values = list(summary.as_dict().values())
         distribution.add_row(name, *[pattern.format(v) for v in values])
     console.print(distribution)
+
+    if zero_sharpness:
+        console.print(
+            f"  [yellow]{zero_sharpness} of {len(scores)} frame(s) have zero "
+            "sharpness[/yellow] — likely blank/failed preview extracts"
+        )
 
     suggested = suggest_thresholds(
         scores,
