@@ -70,6 +70,77 @@ darktriage tui "/path/to/shoot"
 darktriage export "/path/to/shoot" --min-rating 4 --style "My Style"
 ```
 
+See [Recommended workflow](#recommended-workflow) for the full first-run → cull → export loop.
+
+## Recommended workflow
+
+DarkTriage is a **pre-import → cull → export** loop: score previews, calibrate the rating bands to your camera, write non-destructive `.xmp` sidecars, then render the keepers with darktable.
+
+| Step | Command | Writes |
+| --- | --- | --- |
+| Warm preview cache | `previews extract` | preview cache |
+| Calibrate thresholds | `calibrate` | `config.toml` (with `--write`) |
+| Review the mix | `analyze --dry-run` | nothing |
+| Commit ratings | `analyze` | `.xmp` sidecars |
+| Render keepers | `export` | JPEGs in `exported/` |
+
+### 1. First run on a new folder (cold cache)
+
+```bash
+SHOOT="/path/to/shoot"
+
+# a) Warm the embedded-preview cache (optional, makes the first analyze fast)
+darktriage --threads 8 previews extract "$SHOOT"
+
+# b) Calibrate the rating bands for this camera/source (do once per source/season)
+darktriage --threads 8 calibrate "$SHOOT" --sample 300 --use-embedded-preview
+#    review the distribution + suggestions, then persist them:
+darktriage --threads 8 calibrate "$SHOOT" --sample 300 --use-embedded-preview --write
+
+# c) Preview the ratings + rating/label histogram (writes nothing)
+darktriage analyze "$SHOOT" --use-embedded-preview --dry-run
+
+# d) Commit the sidecars (existing ratings/history are preserved)
+darktriage analyze "$SHOOT" --use-embedded-preview
+```
+
+### 2. Every subsequent run (warm cache)
+
+```bash
+darktriage analyze "$SHOOT" --use-embedded-preview
+# add --overwrite to recompute sidecars that already have ratings/history
+```
+
+### 3. Review in Darktable, then export the keepers
+
+Open the folder in Darktable (it imports the star ratings and colour labels), cull as usual, then render the keepers headlessly:
+
+```bash
+darktriage export "$SHOOT" --min-rating 4 --style "Landscape" --style "Sharpen"
+```
+
+### TUI alternative
+
+Prefer a dashboard? Same pipeline, interactive commit:
+
+```bash
+darktriage tui "$SHOOT" --use-embedded-preview
+```
+
+Browse the file list, check the selected frame's metric breakdown, confirm the summary rating/label histogram, then click **Commit XMP sidecars**.
+
+### When to re-calibrate
+
+- A different camera/sensor, season/lighting, or a big ISO-range change.
+- Whenever the printed histogram looks off (too many 4★, too few 1★, no 5★) — adjust `--sharp-percentile` / `--blur-percentile` / `--composition-percentile` / `--clip-percentile` and re-run with `--write`.
+- Always calibrate on the **same source** you analyse with (`--use-embedded-preview` vs Fine JPEG).
+
+### Safety in the loop
+
+- `analyze` writes **only** `.NEF.xmp` sidecars; RAW/JPEG binaries are never modified.
+- Existing sidecars with a user rating or darktable history are **skipped** unless you pass `--overwrite` (and are backed up to `.xmp.bak` when `create_backup = true`).
+- `--dry-run` (analyze) and `--dry-run` (export) plan everything without writing.
+
 ## Global options
 
 These go **before** the subcommand:
