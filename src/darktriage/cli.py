@@ -27,22 +27,13 @@ from rich.progress import (
 from rich.table import Table
 
 from darktriage.config import Config, load_config
-from darktriage.core.exif_reader import (
-    Assessment,
-    detect_bursts,
-    discover_pairs,
-    select_burst_winners,
-)
-from darktriage.core.metrics import (
-    DEFAULT_PROXY_MAX_DIM,
-    load_image_metadata,
-    score_images,
-)
+from darktriage.core.engine import AnalysisOptions, analyze_directory
+from darktriage.core.exif_reader import Assessment, discover_pairs
+from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
     SidecarRequest,
     XmpWriter,
-    derive_rating_and_label,
 )
 from darktriage.export.darktable_cli import (
     batch_export,
@@ -149,94 +140,21 @@ def _analyze_directory(
     workers: Optional[int] = None,
     on_complete: Optional[Callable[[], None]] = None,
 ) -> List[Assessment]:
-    """Score every .NEF/.JPG pair and return per-file assessments.
-
-    ISO and orientation metadata is read per preview and passed through the
-    scoring pipeline (noise filtering, auto-rotation, central-region masking)
-    so results are camera-configurable rather than hardcoded.
-
-    ``on_complete``, if given, is called once per scored JPEG (useful for
-    driving a progress bar).
-    """
-    pairs = discover_pairs(directory)
-    gap = (
-        threshold_seconds
-        if threshold_seconds is not None
-        else config.thresholds.burst_interval_sec
-    )
-    groups = detect_bursts(pairs, threshold_seconds=gap)
-
-    # Build per-file metadata and parallel-score every preview.
-    jpg_pairs = [p for p in pairs if p.jpg_path is not None]
-    items = []
-    for pair in jpg_pairs:
-        meta = load_image_metadata(pair.jpg_path)
-        items.append((pair.jpg_path, meta.iso, meta.orientation))
-
-    scores = score_images(
-        items,
+    """Score every .NEF/.JPG pair via the bounded parallel engine."""
+    options = AnalysisOptions(
         max_dim=max_dim,
         center_fraction=config.sensor.region_center_fraction,
+        blur_threshold=config.thresholds.tenengrad_blur,
+        iso_threshold=config.sensor.iso_blur_above,
         workers=workers,
+    )
+    return analyze_directory(
+        directory,
+        config,
+        options,
+        threshold_seconds=threshold_seconds,
         on_complete=on_complete,
     )
-    score_by_path = {p.jpg_path: s for p, s in zip(jpg_pairs, scores)}
-
-    # The sharpest frame in each burst is the burst winner (+1 star).
-    winner_by_path: Dict[Path, bool] = {}
-    for group in groups:
-        best = max(
-            group.images,
-            key=lambda r: score_by_path[r.jpg_path].sharpness,
-            default=None,
-        )
-        if best is not None:
-            winner_by_path[best.jpg_path] = True
-
-    burst_index_by_path: Dict[Path, int] = {}
-    for gi, group in enumerate(groups):
-        for pair in group.images:
-            burst_index_by_path[pair.raw_path] = gi
-
-    assessments: List[Assessment] = []
-    for pair in pairs:
-        assessment = Assessment(
-            raw_path=pair.raw_path,
-            jpg_path=pair.jpg_path,
-            capture_time=pair.capture_time,
-            burst_index=burst_index_by_path.get(pair.raw_path),
-            is_burst_winner=pair.jpg_path in winner_by_path,
-        )
-
-        if pair.jpg_path is None:
-            assessment.error = "no matching JPEG preview"
-            assessments.append(assessment)
-            continue
-
-        score = score_by_path[pair.jpg_path]
-        if score.error:
-            assessment.error = score.error
-            assessments.append(assessment)
-            continue
-
-        decision = derive_rating_and_label(
-            sharpness=score.sharpness,
-            composition_score=score.composition_score,
-            clipped_fraction=score.clipped_highlight_pct / 100.0,
-            is_burst_winner=assessment.is_burst_winner,
-            thresholds=config.thresholds,
-            tags=config.tags,
-        )
-        assessment.sharpness = score.sharpness
-        assessment.composition_score = score.composition_score
-        assessment.mean_luminance = score.mean_luminance
-        assessment.clipped_highlight_pct = score.clipped_highlight_pct
-        assessment.ev_offset = score.ev_offset
-        assessment.rating = decision.rating
-        assessment.label = decision.label
-        assessments.append(assessment)
-
-    return assessments
 
 
 def _render_assessment_table(assessments: List[Assessment], title: str) -> None:

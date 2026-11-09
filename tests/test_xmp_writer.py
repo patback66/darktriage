@@ -181,9 +181,17 @@ def test_write_batch_single_invocation(tmp_path):
     results = writer.write_batch(requests)
     assert len(results) == 2
     assert all(r.success for r in results)
+    # One execution pass via an ExifTool argfile (-@), not one call per file.
     command = results[0].command
     assert command[0] == "/exiftool"
-    assert command.count("-execute") == 1
+    assert command[1] == "-@"
+
+    lines = writer.build_argfile_lines(requests)
+    assert lines.count("-execute") == 2
+    assert "-XMP-xmp:Rating=5" in lines
+    assert "-XMP-xmp:Rating=4" in lines
+    assert any(line.endswith("A.NEF.xmp") for line in lines)
+    assert any(line.endswith("B.NEF.xmp") for line in lines)
 
 
 def test_write_batch_skips_protected(tmp_path):

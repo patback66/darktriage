@@ -50,6 +50,7 @@ class Score:
     mean_luminance: float
     clipped_highlight_pct: float
     ev_offset: float = 0.0
+    early_exit: bool = False  # True when the blur early-exit path fired
     error: Optional[str] = None
 
 
@@ -93,13 +94,101 @@ def to_grayscale(image: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
+# OpenCV reduced-scale grayscale decode flags.  Decoding at 1/2, 1/4 or 1/8
+# scale happens inside the JPEG DCT decoder and avoids materializing the full
+# 36 MP sensor frame in memory.
+_CV_REDUCED_FLAGS = {
+    1: cv2.IMREAD_GRAYSCALE,
+    2: cv2.IMREAD_REDUCED_GRAYSCALE_2,
+    4: cv2.IMREAD_REDUCED_GRAYSCALE_4,
+    8: cv2.IMREAD_REDUCED_GRAYSCALE_8,
+}
+
+# Optional PyTurboJPEG backend (used only when the native lib is present).
+try:  # pragma: no cover - depends on optional native dependency
+    from turbojpeg import TJPF_GRAY, TurboJPEG
+
+    _TURBOJPEG = TurboJPEG()
+except Exception:  # noqa: BLE001 - optional dependency
+    TJPF_GRAY = None
+    _TURBOJPEG = None
+
+
+def _choose_reduction(long_edge: int, max_dim: int) -> int:
+    """Pick the DCT reduction factor whose result is <= max_dim (1, 2, 4, 8)."""
+    if long_edge <= max_dim:
+        return 1
+    ratio = long_edge / float(max_dim)
+    for factor in (2, 4, 8):
+        if ratio <= factor:
+            return factor
+    return 8
+
+
+def _decode_with_turbojpeg(data: bytes, reduction: int) -> np.ndarray:
+    """Decode to grayscale via PyTurboJPEG at the requested reduction."""
+    scaling = {2: 0.5, 4: 0.25, 8: 0.125}.get(reduction, 1.0)
+    array = _TURBOJPEG.decode(
+        data, pixel_format=TJPF_GRAY, scaling_factor=scaling
+    )
+    return np.asarray(array, dtype=np.uint8)
+
+
+def _decode_grayscale_fast(
+    jpg_path: Union[str, Path], max_dim: int
+) -> np.ndarray:
+    """Decode a JPEG directly to a downscaled grayscale array.
+
+    Uses PyTurboJPEG when available, otherwise OpenCV's reduced-scale
+    ``IMREAD_REDUCED_GRAYSCALE_*`` flags, falling back to Pillow.
+    """
+    data = Path(jpg_path).read_bytes()
+
+    # Header-only dimensions (no pixel decode) to pick the reduction factor.
+    with Image.open(jpg_path) as image:
+        width, height = image.size
+    reduction = _choose_reduction(max(width, height), max_dim)
+
+    array: Optional[np.ndarray]
+    if _TURBOJPEG is not None:
+        try:
+            return _decode_with_turbojpeg(data, reduction)
+        except Exception:  # noqa: BLE001 - fall through to OpenCV
+            pass
+
+    array = cv2.imdecode(
+        np.frombuffer(data, dtype=np.uint8), _CV_REDUCED_FLAGS[reduction]
+    )
+    if array is None:
+        raise ValueError(f"OpenCV could not decode JPEG: {jpg_path}")
+    if array.ndim == 3:
+        array = cv2.cvtColor(array, cv2.COLOR_BGR2GRAY)
+    if max(array.shape) > max_dim:
+        scale = max_dim / float(max(array.shape))
+        array = cv2.resize(
+            array,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+    return array.astype(np.uint8, copy=False)
+
+
 def prepare_proxy(
     jpg_path: Union[str, Path], max_dim: int = DEFAULT_PROXY_MAX_DIM
 ) -> np.ndarray:
-    """Load a camera JPEG and downscale it in memory to max_dim long edge.
+    """Fast-load a camera JPEG as a downscaled single-channel grayscale array.
 
-    Returns a single-channel uint8 grayscale matrix.  Resizing uses Lanczos.
+    Decodes at 1/2, 1/4 or 1/8 scale directly in the DCT domain (PyTurboJPEG /
+    OpenCV reduced flags) to avoid full 36 MP decoding, falling back to a
+    Pillow Lanczos resize if the fast path fails.
     """
+    try:
+        return _decode_grayscale_fast(jpg_path, max_dim)
+    except Exception as exc:  # noqa: BLE001 - fallback to Pillow
+        logger.debug("Fast JPEG decode failed for %s (%s); using Pillow", jpg_path, exc)
+
     with Image.open(jpg_path) as image:
         image = image.convert("RGB")
         width, height = image.size
@@ -112,6 +201,16 @@ def prepare_proxy(
             )
             image = image.resize(new_size, Image.LANCZOS)
         return to_grayscale(np.asarray(image))
+
+
+def central_roi(gray_img: np.ndarray, fraction: float = 0.6) -> np.ndarray:
+    """Return the central ``fraction`` region-of-interest crop."""
+    height, width = gray_img.shape[:2]
+    crop_h = max(1, int(round(height * fraction)))
+    crop_w = max(1, int(round(width * fraction)))
+    y0 = (height - crop_h) // 2
+    x0 = (width - crop_w) // 2
+    return gray_img[y0 : y0 + crop_h, x0 : x0 + crop_w]
 
 
 def compute_tenengrad(gray_img: np.ndarray) -> float:
@@ -229,21 +328,44 @@ def score_image(
     orientation: int = 1,
     center_fraction: float = 0.6,
     iso_threshold: int = 1600,
+    blur_threshold: float = 150.0,
 ) -> Score:
     """Score one JPEG through orientation correction, noise filtering and
-    central-region weighting.
+    central-region-of-interest focus analysis.
 
-    Calling this directly gives full per-camera, per-file control.
+    Flow:
+      1. Fast decode -> orientation correction.
+      2. ISO > ``iso_threshold`` -> 3x3 Gaussian blur noise pre-filter.
+      3. Sobel Tenengrad on the central ``center_fraction`` ROI crop.
+      4. Early exit: if the ROI Tenengrad is below ``blur_threshold`` the
+         frame is flagged as soft/blur and composition + highlight-histogram
+         checks are skipped (only a cheap mean luminance is computed).
     """
     gray = prepare_proxy(jpg_path, max_dim=max_dim)
     gray = apply_orientation(gray, orientation)
-    exposure = check_exposure(gray)
     if iso is not None and iso > iso_threshold:
         gray = apply_noise_filter(gray, iso, iso_threshold)
-    core = apply_region_mask(gray, center_fraction)
+
+    roi = central_roi(gray, center_fraction)
+    sharpness = compute_tenengrad(roi)
+
+    if sharpness < blur_threshold:
+        # Early exit: cheap mean luminance only, skip histogram + composition.
+        mean_luminance = float(roi.mean())
+        return Score(
+            sharpness=sharpness,
+            composition_score=0.0,
+            mean_luminance=mean_luminance,
+            clipped_highlight_pct=0.0,
+            ev_offset=compute_ev_offset(mean_luminance),
+            early_exit=True,
+        )
+
+    exposure = check_exposure(gray)
+    composition = compute_composition_score(roi)
     return Score(
-        sharpness=compute_tenengrad(core),
-        composition_score=compute_composition_score(core),
+        sharpness=sharpness,
+        composition_score=composition,
         mean_luminance=exposure.mean_luminance,
         clipped_highlight_pct=exposure.clipped_highlight_pct,
         ev_offset=compute_ev_offset(exposure.mean_luminance),
@@ -251,11 +373,20 @@ def score_image(
 
 
 def score_item(
-    item: Tuple[str, Optional[int], int], max_dim: int, center_fraction: float
+    item: Tuple[str, Optional[int], int],
+    max_dim: int,
+    center_fraction: float,
+    blur_threshold: float = 150.0,
 ) -> Score:
     path, iso, orientation = item
-    return score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
-                       center_fraction=center_fraction)
+    return score_image(
+        path,
+        max_dim=max_dim,
+        iso=iso,
+        orientation=orientation,
+        center_fraction=center_fraction,
+        blur_threshold=blur_threshold,
+    )
 
 
 def score_images(
@@ -264,6 +395,7 @@ def score_images(
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
     center_fraction: float = 0.6,
     workers: Optional[int] = None,
+    blur_threshold: float = 150.0,
     on_complete: Optional[Callable[[], None]] = None,
 ) -> List[Score]:
     """Score several JPEG previews in parallel.
@@ -279,15 +411,24 @@ def score_images(
     worker_count = workers or min((os.cpu_count() or 1), len(paths))
     if worker_count <= 1 or len(paths) == 1:
         results = [
-            score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
-                       center_fraction=center_fraction)
+            score_image(
+                path,
+                max_dim=max_dim,
+                iso=iso,
+                orientation=orientation,
+                center_fraction=center_fraction,
+                blur_threshold=blur_threshold,
+            )
             for path, iso, orientation in paths
         ]
         if on_complete:
             for _ in results:
                 on_complete()
         return results
-    payloads = [(p, iso, orient, max_dim, center_fraction) for p, iso, orient in paths]
+    payloads = [
+        (p, iso, orient, max_dim, center_fraction, blur_threshold)
+        for p, iso, orient in paths
+    ]
     results: List[Optional[Score]] = [None] * len(payloads)
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         future_to_index = {
@@ -302,10 +443,18 @@ def score_images(
     return [cast(Score, r) for r in results]  # type: ignore[return-value]
 
 
-def _score_job(payload: Tuple[str, Optional[int], int, int, float]) -> Score:
-    path, iso, orientation, max_dim, center_fraction = payload
-    return score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
-                       center_fraction=center_fraction)
+def _score_job(
+    payload: Tuple[str, Optional[int], int, int, float, float]
+) -> Score:
+    path, iso, orientation, max_dim, center_fraction, blur_threshold = payload
+    return score_image(
+        path,
+        max_dim=max_dim,
+        iso=iso,
+        orientation=orientation,
+        center_fraction=center_fraction,
+        blur_threshold=blur_threshold,
+    )
 
 
 def compute_ev_offset(mean_luminance: float) -> float:
