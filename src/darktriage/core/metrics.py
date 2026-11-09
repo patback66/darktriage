@@ -157,6 +157,42 @@ def _decode_with_turbojpeg(data: bytes, reduction: int) -> np.ndarray:
     return array
 
 
+def _jpeg_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    """Parse (width, height) from a JPEG's SOF marker without full decoding.
+
+    Avoids a second file-open (Pillow header read) on the hot decode path.
+    Returns None if no Start-Of-Frame marker is found.
+    """
+    size = len(data)
+    index = 2  # skip SOI
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while index + 9 < size:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker == 0xFF:  # fill byte
+            index += 1
+            continue
+        if marker == 0xD8 or 0xD0 <= marker <= 0xD7:  # SOI / RSTn
+            index += 2
+            continue
+        if marker == 0xDA:  # start of scan -> SOF already passed
+            return None
+        segment_length = (data[index + 2] << 8) | data[index + 3]
+        if marker in sof_markers:
+            height = (data[index + 5] << 8) | data[index + 6]
+            width = (data[index + 7] << 8) | data[index + 8]
+            if width and height:
+                return width, height
+            return None
+        index += 2 + segment_length
+    return None
+
+
 def _decode_grayscale_fast(
     jpg_path: Union[str, Path], max_dim: int
 ) -> np.ndarray:
@@ -164,14 +200,18 @@ def _decode_grayscale_fast(
 
     Uses PyTurboJPEG when available, otherwise OpenCV's reduced-scale
     ``IMREAD_REDUCED_GRAYSCALE_*`` flags, falling back to Pillow on failure.
-    The returned long edge always equals ``min(source_long_edge, max_dim)`` so
-    the fast and Pillow paths produce identical proxy dimensions.
+    The source dimensions are parsed from the in-memory bytes (no second file
+    open), and the returned long edge always equals
+    ``min(source_long_edge, max_dim)`` so the fast and Pillow paths produce
+    identical proxy dimensions.
     """
     data = Path(jpg_path).read_bytes()
 
-    # Header-only dimensions (no pixel decode) to pick the reduction factor.
-    with Image.open(jpg_path) as image:
-        width, height = image.size
+    dimensions = _jpeg_dimensions(data)
+    if dimensions is None:
+        with Image.open(jpg_path) as image:
+            dimensions = image.size
+    width, height = dimensions
     source_long_edge = max(width, height)
     reduction = _choose_reduction(source_long_edge, max_dim)
     target = _target_long_edge(source_long_edge, max_dim)

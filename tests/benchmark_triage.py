@@ -16,7 +16,13 @@ Run directly::
     python3 tests/benchmark_triage.py
     python3 tests/benchmark_triage.py --images 8 --workers 2 --max-dim 1920
 
-Everything is synthetic and self-contained; no fixture files are required.
+Benchmark a real camera folder (synthetic generation is skipped)::
+
+    python3 tests/benchmark_triage.py --dir "/Volumes/Koken Pass/Photos/Hokkaido 2026"
+    python3 tests/benchmark_triage.py --dir "/Volumes/Koken Pass/Photos/Hokkaido 2026" --images 50 --workers 4
+
+Without ``--dir`` everything is synthetic and self-contained; no fixture files
+are required.
 """
 
 from __future__ import annotations
@@ -42,7 +48,12 @@ from PIL import Image
 from darktriage.config import load_config
 from darktriage.core.engine import AnalysisOptions, analyze_directory
 from darktriage.core.exif_reader import discover_pairs
-from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM, prepare_proxy, score_image
+from darktriage.core.metrics import (
+    DEFAULT_PROXY_MAX_DIM,
+    prepare_proxy,
+    score_image,
+    score_images,
+)
 
 # --------------------------------------------------------------------------- #
 # Synthetic frame parameters
@@ -69,6 +80,9 @@ EXIF_TAG_ISO = 0x8827
 
 ISO_LOW = 800
 ISO_HIGH = 3200
+
+# JPEG preview extensions recognised in real-folder mode.
+JPG_SUFFIXES = {".jpg", ".jpeg"}
 
 Row = Tuple[str, str]
 
@@ -318,6 +332,52 @@ def bench_engine(directory: Path, max_dim: int, workers: int) -> EngineStats:
     )
 
 
+def discover_jpegs(directory: Path, limit: Optional[int] = None) -> List[Path]:
+    """Return real, decodable JPEG previews in a folder, sorted by name.
+
+    Skips macOS AppleDouble/resource-fork files (``._NAME``), hidden files, and
+    any file whose header Pillow cannot identify, so a stray sidecar cannot
+    abort the benchmark.  ``limit`` stops scanning once enough valid previews
+    have been collected.
+    """
+    found: List[Path] = []
+    for path in sorted(directory.iterdir(), key=lambda p: p.name):
+        if limit is not None and len(found) >= limit:
+            break
+        if not path.is_file():
+            continue
+        if path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in JPG_SUFFIXES:
+            continue
+        try:
+            with Image.open(path) as image:
+                image.size  # header-only validation; raises if not a real image
+        except Exception:  # noqa: BLE001 - skip unreadable/corrupt files
+            continue
+        found.append(path)
+    return found
+
+
+def bench_parallel_scoring(
+    jpg_paths: Sequence[Path], max_dim: int, workers: int
+) -> EngineStats:
+    """Parallel scoring phase for JPEG-only folders (no RAW pairs present)."""
+    if not jpg_paths:
+        return EngineStats(Timing("parallel score_images", 0, 0.0), 0, 0, 0)
+    items = [(str(path), None, 1) for path in jpg_paths]
+    gc.collect()
+    start = time.perf_counter()
+    scores = score_images(items, max_dim=max_dim, workers=workers)
+    seconds = time.perf_counter() - start
+    return EngineStats(
+        timing=Timing("parallel score_images", len(scores), seconds),
+        pair_count=0,
+        burst_winners=0,
+        rated=sum(1 for score in scores if score.error is None),
+    )
+
+
 def tracemalloc_probe(jpg_path: Path, max_dim: int) -> float:
     """Peak Python heap (MB) for a single decode + score, via ``tracemalloc``."""
     tracemalloc.start()
@@ -402,6 +462,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--keep", action="store_true", help="keep the generated temp directory"
     )
+    parser.add_argument(
+        "--dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "benchmark against real camera folders instead of synthetic frames "
+            "(e.g. --dir \"/Volumes/Koken Pass/Photos/Hokkaido 2026\"). "
+            "--images caps how many JPEG previews are sampled for phases 1-3; "
+            "the parallel engine phase processes the whole folder."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.images < 1:
         parser.error("--images must be >= 1")
@@ -411,6 +483,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--max-dim must be >= 64")
     if args.frame_dim < 320:
         parser.error("--frame-dim must be >= 320")
+    if args.dir is not None:
+        if not args.dir.expanduser().is_dir():
+            parser.error(f"--dir is not a directory: {args.dir}")
+        args.dir = args.dir.expanduser().resolve()
     args.workers = min(args.workers, max(1, args.images))
     return args
 
@@ -478,46 +554,72 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run every benchmark phase and print the report."""
     args = parse_args(argv)
     overall_start = time.perf_counter()
-    width, height = frame_size(args.frame_dim)
-    megapixels = width * height / 1e6
 
-    work_dir = Path(tempfile.mkdtemp(prefix="darktriage-bench-"))
+    work_dir: Optional[Path] = None
     try:
-        banner("DarkTriage throughput benchmark (synthetic D800E batch)")
-        summary_table(
-            [
-                ("Python", sys.version.split()[0]),
-                ("frame size", f"{width}x{height} ({megapixels:.1f} MP)"),
-                ("images", str(args.images)),
-                ("proxy max_dim", f"{args.max_dim} px long edge"),
-                ("engine workers", str(args.workers)),
-                ("temp dir", str(work_dir)),
-            ]
-        )
-        baseline_rss = peak_rss_mb()
-
-        # -- phase 0: generate the batch -------------------------------------
-        print(f"\n[0/4] generating {args.images} JPEG+NEF pairs ", end="")
-        jpg_paths, gen_seconds = write_frames(
-            work_dir, args.images, (width, height), args.seed
-        )
-        total_mb = (
-            sum(p.stat().st_size for p in work_dir.iterdir() if p.is_file())
-            / (1024 * 1024)
-        )
-        print(
-            f"      generated {len(jpg_paths)} pairs, {total_mb:.1f} MB on disk"
-            f" | {gen_seconds:.2f} s"
-            f" ({gen_seconds / len(jpg_paths) * 1000:.0f} ms/frame)"
-        )
-
-        pairs = discover_pairs(work_dir)
-        matched = sum(1 for pair in pairs if pair.jpg_path is not None)
-        timed = sum(1 for pair in pairs if pair.capture_time is not None)
-        print(
-            f"      discover_pairs: {len(pairs)} RAW, {matched} matched JPEG,"
-            f" {timed} with DateTimeOriginal EXIF"
-        )
+        if args.dir is not None:
+            banner("DarkTriage throughput benchmark (real folder)")
+            jpg_paths = discover_jpegs(args.dir, limit=args.images)
+            if not jpg_paths:
+                print(f"  no JPEG previews (.jpg/.jpeg) found in {args.dir}")
+                return 2
+            with Image.open(jpg_paths[0]) as image:
+                real_width, real_height = image.size
+            megapixels = real_width * real_height / 1e6
+            summary_table(
+                [
+                    ("Python", sys.version.split()[0]),
+                    ("source folder", str(args.dir)),
+                    ("sampled JPEGs", f"{len(jpg_paths)} (cap --images {args.images})"),
+                    ("frame size", f"{real_width}x{real_height} ({megapixels:.1f} MP)"),
+                    ("proxy max_dim", f"{args.max_dim} px long edge"),
+                    ("engine workers", str(args.workers)),
+                ]
+            )
+            pairs = discover_pairs(args.dir)
+            matched = sum(1 for pair in pairs if pair.jpg_path is not None)
+            print(f"\n  discover_pairs: {len(pairs)} RAW, {matched} matched JPEG")
+            source_dir = args.dir
+            has_raw_pairs = matched > 0
+            baseline_rss = peak_rss_mb()
+        else:
+            work_dir = Path(tempfile.mkdtemp(prefix="darktriage-bench-"))
+            width, height = frame_size(args.frame_dim)
+            megapixels = width * height / 1e6
+            banner("DarkTriage throughput benchmark (synthetic D800E batch)")
+            summary_table(
+                [
+                    ("Python", sys.version.split()[0]),
+                    ("frame size", f"{width}x{height} ({megapixels:.1f} MP)"),
+                    ("images", str(args.images)),
+                    ("proxy max_dim", f"{args.max_dim} px long edge"),
+                    ("engine workers", str(args.workers)),
+                    ("temp dir", str(work_dir)),
+                ]
+            )
+            baseline_rss = peak_rss_mb()
+            print(f"\n[0/4] generating {args.images} JPEG+NEF pairs ", end="")
+            jpg_paths, gen_seconds = write_frames(
+                work_dir, args.images, (width, height), args.seed
+            )
+            total_mb = (
+                sum(p.stat().st_size for p in work_dir.iterdir() if p.is_file())
+                / (1024 * 1024)
+            )
+            print(
+                f"      generated {len(jpg_paths)} pairs, {total_mb:.1f} MB on disk"
+                f" | {gen_seconds:.2f} s"
+                f" ({gen_seconds / len(jpg_paths) * 1000:.0f} ms/frame)"
+            )
+            pairs = discover_pairs(work_dir)
+            matched = sum(1 for pair in pairs if pair.jpg_path is not None)
+            timed = sum(1 for pair in pairs if pair.capture_time is not None)
+            print(
+                f"      discover_pairs: {len(pairs)} RAW, {matched} matched JPEG,"
+                f" {timed} with DateTimeOriginal EXIF"
+            )
+            source_dir = work_dir
+            has_raw_pairs = True
 
         # -- phase 1: decode-only vs reference -------------------------------
         print("\n[1/4] decode-only throughput: prepare_proxy() vs full PIL decode")
@@ -555,17 +657,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # -- phase 4: parallel engine ----------------------------------------
         workers_label = "worker" if args.workers == 1 else "workers"
-        print(f"\n[4/4] parallel engine: analyze_directory() with {args.workers} {workers_label}")
-        engine = bench_engine(work_dir, args.max_dim, args.workers)
-        print(f"      {rate_line(engine.timing)}")
         print(
-            f"      pairs {engine.pair_count} | burst winners {engine.burst_winners}"
-            f" | rated {engine.rated}"
+            f"\n[4/4] parallel engine with {args.workers} {workers_label}"
         )
-        print(
-            "      (wall time covers pairing, serial EXIF metadata decode and"
-            " pool start-up, so it is the end-to-end number)"
-        )
+        if has_raw_pairs:
+            engine = bench_engine(source_dir, args.max_dim, args.workers)
+            print(f"      {rate_line(engine.timing)}")
+            print(
+                f"      pairs {engine.pair_count} | burst winners"
+                f" {engine.burst_winners} | rated {engine.rated}"
+            )
+            print(
+                "      (whole-folder analyze_directory: pairing + EXIF + pool;"
+                " this is the end-to-end number)"
+            )
+        else:
+            engine = bench_parallel_scoring(jpg_paths, args.max_dim, args.workers)
+            print(f"      {rate_line(engine.timing)}")
+            print("      (JPEG-only folder: no .NEF pairs, using parallel score_images())")
 
         peak_mb = peak_rss_mb()
         return finish(
@@ -573,10 +682,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             peak_mb, baseline_rss, heap_peak, overall_start,
         )
     finally:
-        if args.keep:
-            print(f"  kept temp dir: {work_dir}")
-        else:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        if work_dir is not None:
+            if args.keep:
+                print(f"  kept temp dir: {work_dir}")
+            else:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
