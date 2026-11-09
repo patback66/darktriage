@@ -27,8 +27,12 @@ from rich.progress import (
 from rich.table import Table
 
 from darktriage.config import Config, load_config
-from darktriage.core.engine import AnalysisOptions, analyze_directory
-from darktriage.core.exif_reader import Assessment, discover_pairs
+from darktriage.core.engine import (
+    DEFAULT_CHUNK_SIZE,
+    AnalysisOptions,
+    analyze_directory,
+)
+from darktriage.core.exif_reader import Assessment, ImagePair, discover_pairs
 from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
@@ -89,6 +93,21 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--dry-run", action="store_true", help="preview ratings without writing files"
     )
+    analyze.add_argument(
+        "--use-embedded-preview",
+        action="store_true",
+        help=(
+            "score the small JPEG embedded in each RAW instead of the full Fine "
+            "JPEG (much faster on large batches; needs exiftool, falls back "
+            "per-file to the JPEG)"
+        ),
+    )
+    analyze.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="files processed per parallel work chunk (bounds memory)",
+    )
     analyze.set_defaults(func=cmd_analyze)
 
     tui = sub.add_parser("tui", help="launch the interactive Textual dashboard")
@@ -101,6 +120,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_PROXY_MAX_DIM,
         help="proxy long-edge size in pixels (default: 1920)",
+    )
+    tui.add_argument(
+        "--use-embedded-preview",
+        action="store_true",
+        help="score the RAW's embedded JPEG preview instead of the Fine JPEG",
+    )
+    tui.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="files processed per parallel work chunk (bounds memory)",
     )
     tui.set_defaults(func=cmd_tui)
 
@@ -139,6 +169,9 @@ def _analyze_directory(
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
     workers: Optional[int] = None,
     on_complete: Optional[Callable[[], None]] = None,
+    use_embedded_preview: bool = False,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    pairs: Optional[List[ImagePair]] = None,
 ) -> List[Assessment]:
     """Score every .NEF/.JPG pair via the bounded parallel engine."""
     options = AnalysisOptions(
@@ -147,6 +180,8 @@ def _analyze_directory(
         blur_threshold=config.thresholds.tenengrad_blur,
         iso_threshold=config.sensor.iso_blur_above,
         workers=workers,
+        chunk_size=chunk_size,
+        use_embedded_preview=use_embedded_preview,
     )
     return analyze_directory(
         directory,
@@ -154,6 +189,7 @@ def _analyze_directory(
         options,
         threshold_seconds=threshold_seconds,
         on_complete=on_complete,
+        pairs=pairs,
     )
 
 
@@ -188,8 +224,10 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
 
 
 def cmd_analyze(args) -> int:
-    jpg_count = len(
-        [p for p in discover_pairs(args.dir) if p.jpg_path is not None]
+    pairs = discover_pairs(args.dir)
+    use_embedded = getattr(args, "use_embedded_preview", False)
+    total = len(pairs) if use_embedded else sum(
+        1 for p in pairs if p.jpg_path is not None
     )
 
     with Progress(
@@ -202,7 +240,7 @@ def cmd_analyze(args) -> int:
         console=console,
         transient=True,
     ) as progress:
-        score_task = progress.add_task("Scoring images", total=jpg_count)
+        score_task = progress.add_task("Scoring images", total=total)
 
         def _advance_scoring() -> None:
             progress.update(score_task, advance=1)
@@ -214,8 +252,11 @@ def cmd_analyze(args) -> int:
             max_dim=args.max_dim,
             workers=getattr(args, "threads", None),
             on_complete=_advance_scoring,
+            use_embedded_preview=use_embedded,
+            chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
+            pairs=pairs,
         )
-        progress.update(score_task, completed=jpg_count)
+        progress.update(score_task, completed=total)
         progress.stop_task(score_task)
         progress.refresh()
 
@@ -288,6 +329,8 @@ def cmd_tui(args) -> int:
             threshold=args.burst_threshold,
             max_dim=args.max_dim,
             workers=getattr(args, "threads", None),
+            use_embedded_preview=getattr(args, "use_embedded_preview", False),
+            chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
         ).run()
     except ImportError as exc:
         console.print(f"[red]Textual is required for the TUI: {exc}[/red]")

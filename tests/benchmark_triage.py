@@ -313,10 +313,19 @@ class EngineStats:
     rated: int
 
 
-def bench_engine(directory: Path, max_dim: int, workers: int) -> EngineStats:
+def bench_engine(
+    directory: Path,
+    max_dim: int,
+    workers: int,
+    use_embedded_preview: bool = False,
+) -> EngineStats:
     """Time a single full ``analyze_directory()`` pass (pairs + bursts + pool)."""
     config = load_config()
-    options = AnalysisOptions(max_dim=max_dim, workers=workers)
+    options = AnalysisOptions(
+        max_dim=max_dim,
+        workers=workers,
+        use_embedded_preview=use_embedded_preview,
+    )
     pair_count = len(discover_pairs(directory))
 
     gc.collect()
@@ -459,6 +468,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="images used for the reference full-decode baseline (cost control)",
     )
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
+    parser.add_argument(
+        "--use-embedded-preview",
+        action="store_true",
+        help="engine phase scores each RAW's embedded JPEG preview instead of "
+        "the Fine JPEG (much faster; needs exiftool)",
+    )
     parser.add_argument(
         "--keep", action="store_true", help="keep the generated temp directory"
     )
@@ -661,7 +676,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"\n[4/4] parallel engine with {args.workers} {workers_label}"
         )
         if has_raw_pairs:
-            engine = bench_engine(source_dir, args.max_dim, args.workers)
+            engine = bench_engine(
+                source_dir,
+                args.max_dim,
+                args.workers,
+                use_embedded_preview=args.use_embedded_preview,
+            )
             print(f"      {rate_line(engine.timing)}")
             print(
                 f"      pairs {engine.pair_count} | burst winners"

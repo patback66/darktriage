@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from darktriage.cli import _analyze_directory
 from darktriage.config import Config
+from darktriage.core.engine import DEFAULT_CHUNK_SIZE
 from darktriage.core.exif_reader import Assessment, discover_pairs
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
@@ -66,6 +67,8 @@ class DarkTriageApp(App):
         threshold: Optional[float] = None,
         max_dim: int = 1920,
         workers: Optional[int] = None,
+        use_embedded_preview: bool = False,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ):
         super().__init__()
         self.assessments: List[Assessment] = list(assessments or [])
@@ -74,6 +77,8 @@ class DarkTriageApp(App):
         self.threshold = threshold
         self.max_dim = max_dim
         self._scoring_workers = workers
+        self.use_embedded_preview = use_embedded_preview
+        self.chunk_size = chunk_size
         self.selected: Optional[Assessment] = None
         self._commit_in_progress = False
         self._analysis_ready = False
@@ -136,7 +141,10 @@ class DarkTriageApp(App):
         try:
             self.call_from_thread(self._set_analysis_status, "Discovering images...")
             pairs = discover_pairs(self.directory)
-            jpg_count = len([p for p in pairs if p.jpg_path is not None])
+            if self.use_embedded_preview:
+                jpg_count = len(pairs)
+            else:
+                jpg_count = len([p for p in pairs if p.jpg_path is not None])
 
             progress = self.query_one("#analyze-progress", ProgressBar)
             self.call_from_thread(
@@ -154,6 +162,9 @@ class DarkTriageApp(App):
                 max_dim=self.max_dim,
                 workers=self._scoring_workers,
                 on_complete=advance,
+                use_embedded_preview=self.use_embedded_preview,
+                chunk_size=self.chunk_size,
+                pairs=pairs,
             )
             self.call_from_thread(self._analysis_done, assessments)
         except Exception as exc:  # noqa: BLE001
