@@ -9,9 +9,11 @@ or darktable edit history is preserved unless overwrite is explicitly set.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Union
@@ -259,22 +261,39 @@ class XmpWriter:
             stderr=proc.stderr,
         )
 
+    def build_argfile_lines(self, requests: Iterable[SidecarRequest]) -> List[str]:
+        """Build ExifTool -@ argfile lines for a batch of sidecar writes.
+
+        ``-execute`` separates independent command groups and is emitted only
+        *between* groups (a trailing ``-execute`` would create an empty final
+        command that ExifTool rejects with "Nothing to do").
+        """
+        requests = list(requests)
+        lines: List[str] = []
+        for index, request in enumerate(requests):
+            if index > 0:
+                lines.append("-execute")
+            lines.extend(
+                self._build_args(request.rating, request.label, request.ev_offset)
+            )
+            lines.append(str(xmp_sidecar_path(request.raw_path)))
+        return lines
+
     def write_batch(
         self,
         requests: Iterable[SidecarRequest],
         *,
         on_complete: Optional[Callable[[], None]] = None,
     ) -> List[WriteResult]:
-        """Write many sidecars in a single exiftool invocation.
+        """Write many sidecars in a single ExifTool execution pass.
 
-        Independent tag groups are joined with exiftool's ``-execute``
-        separator to minimise process-spawn overhead.  Sidecars protected by
-        ``should_write_xmp`` are skipped without touching the file.
+        A temporary ``exiftool -@ argfile`` is generated (one argument per
+        line, ``-execute`` between independent groups) so the whole batch is
+        applied by one process without hitting OS argv-length limits.
         """
         requests = list(requests)
         runnable: List[SidecarRequest] = []
         runnable_paths = set()
-
         for request in requests:
             xmp_path = xmp_sidecar_path(request.raw_path)
             if not should_write_xmp(xmp_path, overwrite=request.overwrite):
@@ -282,32 +301,38 @@ class XmpWriter:
             runnable.append(request)
             runnable_paths.add(xmp_path)
 
-        command: List[str] = [self.exiftool]
-        for index, request in enumerate(runnable):
-            if index > 0:
-                command.append("-execute")
-            xmp_path = xmp_sidecar_path(request.raw_path)
-            if self.create_backup and not self.dry_run and xmp_path.exists():
-                backup_sidecar(xmp_path)
-            self._ensure_sidecar(xmp_path)
-            command.extend(
-                self._build_args(request.rating, request.label, request.ev_offset)
-            )
-            command.append(str(xmp_path))
-
         success, stderr = True, ""
+        command: List[str] = []
         if runnable:
+            for request in runnable:
+                xmp_path = xmp_sidecar_path(request.raw_path)
+                if self.create_backup and not self.dry_run and xmp_path.exists():
+                    backup_sidecar(xmp_path)
+                self._ensure_sidecar(xmp_path)
+
+            lines = self.build_argfile_lines(runnable)
+            command = [self.exiftool, "-@", "<argfile>"]
             if self.verbose:
-                logger.info("exiftool: %s", " ".join(command))
+                logger.info("exiftool -@ argfile (%d lines)", len(lines))
             if not self.dry_run:
-                proc = subprocess.run(command, capture_output=True, text=True)
-                success, stderr = proc.returncode == 0, proc.stderr
-                if not success:
-                    logger.warning(
-                        "exiftool batch failed (%s): %s",
-                        proc.returncode,
-                        stderr.strip(),
-                    )
+                fd, argfile = tempfile.mkstemp(suffix=".args", prefix="darktriage-")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write("\n".join(lines) + "\n")
+                    command = [self.exiftool, "-@", argfile]
+                    proc = subprocess.run(command, capture_output=True, text=True)
+                    success, stderr = proc.returncode == 0, proc.stderr
+                    if not success:
+                        logger.warning(
+                            "exiftool batch failed (%s): %s",
+                            proc.returncode,
+                            stderr.strip(),
+                        )
+                finally:
+                    try:
+                        os.unlink(argfile)
+                    except OSError:
+                        pass
             if on_complete:
                 on_complete()
 
