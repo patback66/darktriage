@@ -16,6 +16,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
@@ -352,3 +353,44 @@ def format_label_histogram(summary: RatingSummary) -> str:
     keys = [name for name in order if name in summary.by_label]
     keys += [name for name in summary.by_label if name not in order]
     return " · ".join(f"{name} {summary.by_label[name]}" for name in keys)
+
+
+def assessment_to_dict(assessment: Assessment) -> dict:
+    """Serialize an Assessment to a JSON-friendly dict."""
+    return {
+        "raw_path": str(assessment.raw_path),
+        "jpg_path": str(assessment.jpg_path) if assessment.jpg_path else None,
+        "capture_time": assessment.capture_time.isoformat()
+        if assessment.capture_time
+        else None,
+        "burst_index": assessment.burst_index,
+        "is_burst_winner": assessment.is_burst_winner,
+        "sharpness": assessment.sharpness,
+        "composition_score": assessment.composition_score,
+        "mean_luminance": assessment.mean_luminance,
+        "clipped_highlight_pct": assessment.clipped_highlight_pct,
+        "ev_offset": assessment.ev_offset,
+        "rating": assessment.rating,
+        "label": assessment.label,
+        "error": assessment.error,
+    }
+
+
+def assessment_from_dict(data: dict) -> Assessment:
+    """Rebuild an Assessment from :func:`assessment_to_dict` output."""
+    capture = data.get("capture_time")
+    return Assessment(
+        raw_path=Path(data["raw_path"]),
+        jpg_path=Path(data["jpg_path"]) if data.get("jpg_path") else None,
+        capture_time=datetime.fromisoformat(capture) if capture else None,
+        burst_index=data.get("burst_index"),
+        is_burst_winner=bool(data.get("is_burst_winner", False)),
+        sharpness=data.get("sharpness"),
+        composition_score=data.get("composition_score"),
+        mean_luminance=data.get("mean_luminance"),
+        clipped_highlight_pct=data.get("clipped_highlight_pct"),
+        ev_offset=data.get("ev_offset"),
+        rating=data.get("rating"),
+        label=data.get("label"),
+        error=data.get("error"),
+    )

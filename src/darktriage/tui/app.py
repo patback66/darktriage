@@ -7,17 +7,22 @@ progress, and the file list is populated once analysis completes.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from typing import List, Optional
 
-from darktriage.cli import _analyze_directory
 from darktriage.config import Config
 from darktriage.core.engine import (
     DEFAULT_CHUNK_SIZE,
+    assessment_from_dict,
     format_label_histogram,
     format_rating_histogram,
     summarize_assessments,
 )
-from darktriage.core.exif_reader import Assessment, discover_pairs
+from darktriage.core.exif_reader import Assessment
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
     SidecarRequest,
@@ -148,40 +153,102 @@ class DarkTriageApp(App):
     # Background analysis (runs on mount)
     # ------------------------------------------------------------------
 
+    def _analysis_command(self, json_path: Path) -> List[str]:
+        """Build argv for an isolated ``analyze --json-out`` child process."""
+        command: List[str] = [sys.executable, "-m", "darktriage"]
+        config_path = (
+            getattr(self.config, "config_path", None) if self.config else None
+        )
+        if config_path:
+            command += ["--config", str(config_path)]
+        if self._scoring_workers:
+            command += ["--threads", str(self._scoring_workers)]
+        command += [
+            "analyze",
+            self.directory,
+            "--json-out",
+            str(json_path),
+            "--dry-run",
+            "--max-dim",
+            str(self.max_dim),
+            "--chunk-size",
+            str(self.chunk_size),
+        ]
+        if self.use_embedded_preview:
+            command.append("--use-embedded-preview")
+        if self.preview_cache_dir:
+            command += ["--preview-cache-dir", str(self.preview_cache_dir)]
+        if self.threshold is not None:
+            command += ["--burst-threshold", str(self.threshold)]
+        return command
+
     def _do_analysis(self) -> None:
-        """Run the full analysis pipeline in a worker thread."""
+        """Analyze in a child process.
+
+        Running the ``ProcessPoolExecutor`` inside the Textual/asyncio process
+        (especially after the event loop owns fds) triggers
+        ``bad value(s) in fds_to_keep`` on macOS.  A dedicated child process
+        runs the exact same ``analyze`` pipeline safely and streams progress.
+        """
+        json_path: Optional[Path] = None
         try:
-            self.call_from_thread(self._set_analysis_status, "Discovering images...")
-            pairs = discover_pairs(self.directory)
-            if self.use_embedded_preview:
-                jpg_count = len(pairs)
-            else:
-                jpg_count = len([p for p in pairs if p.jpg_path is not None])
+            handle = tempfile.NamedTemporaryFile(
+                suffix=".json", prefix="darktriage-tui-", delete=False
+            )
+            json_path = Path(handle.name)
+            handle.close()
 
+            command = self._analysis_command(json_path)
             progress = self.query_one("#analyze-progress", ProgressBar)
-            self.call_from_thread(
-                progress.update, total=jpg_count, progress=0
-            )
-            self.call_from_thread(self._set_analysis_status, "Scoring images...")
+            self.call_from_thread(self._set_analysis_status, "Analyzing...")
 
-            def advance() -> None:
-                self.call_from_thread(progress.advance, 1)
-
-            assessments = _analyze_directory(
-                self.directory,
-                self.config,
-                threshold_seconds=self.threshold,
-                max_dim=self.max_dim,
-                workers=self._scoring_workers,
-                on_complete=advance,
-                use_embedded_preview=self.use_embedded_preview,
-                chunk_size=self.chunk_size,
-                preview_cache_dir=self.preview_cache_dir,
-                pairs=pairs,
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
             )
+            error_lines: List[str] = []
+            assert proc.stderr is not None
+            for raw_line in proc.stderr:
+                line = raw_line.rstrip("\n")
+                if line.startswith("darktriage-progress "):
+                    parts = line.split()
+                    try:
+                        if parts[1] == "discovered":
+                            total = int(parts[2])
+                            self.call_from_thread(
+                                progress.update, total=total, progress=0
+                            )
+                            self.call_from_thread(
+                                self._set_analysis_status, "Scoring images..."
+                            )
+                        elif parts[1] == "scored":
+                            done = int(parts[2])
+                            self.call_from_thread(progress.update, progress=done)
+                    except (IndexError, ValueError):
+                        continue
+                elif line.strip():
+                    error_lines.append(line)
+
+            proc.wait()
+            if proc.returncode != 0:
+                detail = "\n".join(error_lines[-20:]) or (
+                    f"analysis exited with code {proc.returncode}"
+                )
+                raise RuntimeError(detail)
+
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            assessments = [assessment_from_dict(item) for item in payload]
             self.call_from_thread(self._analysis_done, assessments)
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(self._analysis_failed, str(exc))
+        finally:
+            if json_path is not None:
+                try:
+                    json_path.unlink()
+                except OSError:
+                    pass
 
     def _analysis_done(self, assessments: List[Assessment]) -> None:
         """Populate the UI once background analysis completes."""
