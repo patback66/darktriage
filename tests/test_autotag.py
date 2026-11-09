@@ -113,3 +113,63 @@ def test_writer_preserves_existing_subjects(tmp_path):
     joined = " ".join(result.command)
     assert "-XMP-dc:Subject+=landscape" in joined
     assert "Subject+=portrait" not in joined
+
+
+def test_select_new_tags_case_insensitive_and_alias():
+    from darktriage.core.autotag import select_new_tags
+
+    # existing 'People' satisfies auto 'people'
+    assert select_new_tags(["People"], ["people", "landscape"]) == ("landscape",)
+    # synonym 'persons' satisfies 'people'
+    assert select_new_tags(["persons"], ["people"]) == ()
+    # fill mode only writes when no keywords exist
+    assert select_new_tags(["x"], ["people"], mode="fill") == ()
+    assert select_new_tags([], ["people"], mode="fill") == ("people",)
+    # off mode never writes
+    assert select_new_tags([], ["people"], mode="off") == ()
+
+
+def test_writer_skips_existing_keyword_case_insensitively(tmp_path):
+    xmp = xmp_sidecar_path(tmp_path / "D.NEF")
+    xmp.write_text(
+        "<x:xmpmeta><rdf:RDF><rdf:Description>"
+        "<dc:subject><rdf:Bag><rdf:li>People</rdf:li></rdf:Bag></dc:subject>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>"
+    )
+    writer = XmpWriter(exiftool="/exiftool", dry_run=True)
+    result = writer.write(tmp_path / "D.NEF", 4, "green", tags=("people",))
+    assert "Subject" not in " ".join(result.command)
+
+
+def test_writer_merges_by_synonym(tmp_path):
+    xmp = xmp_sidecar_path(tmp_path / "D.NEF")
+    xmp.write_text(
+        "<x:xmpmeta><rdf:RDF><rdf:Description>"
+        "<dc:subject><rdf:Bag><rdf:li>persons</rdf:li></rdf:Bag></dc:subject>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>"
+    )
+    writer = XmpWriter(exiftool="/exiftool", dry_run=True)
+    result = writer.write(
+        tmp_path / "D.NEF", 4, "green", tags=("people", "landscape")
+    )
+    joined = " ".join(result.command)
+    assert "-XMP-dc:Subject+=landscape" in joined
+    assert "Subject+=people" not in joined
+
+
+def test_writer_fill_mode_skips_when_keywords_exist(tmp_path):
+    xmp = xmp_sidecar_path(tmp_path / "D.NEF")
+    xmp.write_text(
+        "<x:xmpmeta><rdf:RDF><rdf:Description>"
+        "<dc:subject><rdf:Bag><rdf:li>holiday</rdf:li></rdf:Bag></dc:subject>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>"
+    )
+    writer = XmpWriter(exiftool="/exiftool", dry_run=True, tag_merge="fill")
+    result = writer.write(tmp_path / "D.NEF", 4, "green", tags=("people",))
+    assert "Subject" not in " ".join(result.command)
+
+
+def test_writer_off_mode_never_writes_tags(tmp_path):
+    writer = XmpWriter(exiftool="/exiftool", dry_run=True, tag_merge="off")
+    result = writer.write(tmp_path / "D.NEF", 4, "green", tags=("people",))
+    assert "Subject" not in " ".join(result.command)

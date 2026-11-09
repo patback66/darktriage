@@ -344,7 +344,9 @@ class DarkTriageApp(App):
             writer = XmpWriter(
                 create_backup=self.config.safety.create_backup
                 if self.config
-                else True
+                else True,
+                tag_merge=self.config.autotag.merge if self.config else "union",
+                tag_aliases=self.config.autotag.aliases if self.config else None,
             )
         except ExifToolNotFoundError as exc:
             self._set_status(str(exc))

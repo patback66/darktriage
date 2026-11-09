@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 try:
     import tomllib  # Python 3.11+
@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 
 CONFIG_DIR = "darktriage"
 CONFIG_FILE = "config.toml"
+
+# Default synonym table for merging auto-tags with existing XMP keywords.
+# canonical tag -> accepted synonyms (case-insensitive).
+DEFAULT_TAG_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "people": ("person", "persons", "human", "humans", "folk"),
+    "portrait": ("portraits", "headshot", "headshots"),
+    "group": ("groups", "crowd", "crowds"),
+    "landscape": ("landscapes", "scenery", "scenic", "vista", "vistas"),
+    "nature": ("outdoors", "wilderness", "forest", "forests"),
+    "night": ("nightscape", "nightscapes", "lowlight"),
+    "car": ("cars", "vehicle", "vehicles", "automobile", "automobiles"),
+}
 
 DEFAULT_CONFIG_TEMPLATE = """\
 [safety]
@@ -49,6 +61,18 @@ config_dir = "~/.config/darktable"
 [sensor]
 iso_blur_above = 1600
 region_center_fraction = 0.6
+
+[autotag]
+merge = "union"
+
+[autotag.aliases]
+people = ["person", "persons", "human", "humans", "folk"]
+portrait = ["portraits", "headshot", "headshots"]
+group = ["groups", "crowd", "crowds"]
+landscape = ["landscapes", "scenery", "scenic", "vista", "vistas"]
+nature = ["outdoors", "wilderness", "forest", "forests"]
+night = ["nightscape", "nightscapes", "lowlight"]
+car = ["cars", "vehicle", "vehicles", "automobile", "automobiles"]
 """
 
 
@@ -95,12 +119,29 @@ class Darktable:
 
 
 @dataclass(frozen=True)
+class AutoTag:
+    """Auto-tagging merge behaviour.
+
+    merge: "union" (add missing auto tags), "fill" (only when no keywords
+    exist), or "off" (never add keywords).
+    aliases: canonical tag -> accepted synonyms, so a tag the user already
+    applied under a different spelling is not duplicated.
+    """
+
+    merge: str = "union"
+    aliases: Dict[str, Tuple[str, ...]] = field(
+        default_factory=lambda: dict(DEFAULT_TAG_ALIASES)
+    )
+
+
+@dataclass(frozen=True)
 class Config:
     safety: Safety
     thresholds: Thresholds
     tags: Tags
     darktable: Darktable
     sensor: Sensor = field(default_factory=Sensor)
+    autotag: AutoTag = field(default_factory=AutoTag)
     config_path: Optional[Path] = None
 
 
@@ -139,6 +180,7 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Config:
     tags_raw = _section(data, "tags")
     darktable_raw = _section(data, "darktable")
     sensor_raw = _section(data, "sensor")
+    autotag_raw = _section(data, "autotag")
 
     safety = Safety(
         preserve_existing=_value(safety_raw, "preserve_existing", True),
@@ -166,12 +208,24 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Config:
         iso_blur_above=_value(sensor_raw, "iso_blur_above", 1600),
         region_center_fraction=_value(sensor_raw, "region_center_fraction", 0.6),
     )
+    aliases = dict(DEFAULT_TAG_ALIASES)
+    aliases_raw = autotag_raw.get("aliases", {})
+    if isinstance(aliases_raw, dict):
+        for key, values in aliases_raw.items():
+            if isinstance(values, (list, tuple)):
+                aliases[str(key)] = tuple(str(v) for v in values)
+            elif isinstance(values, str):
+                aliases[str(key)] = (values,)
+    autotag = AutoTag(
+        merge=str(_value(autotag_raw, "merge", "union")), aliases=aliases
+    )
     return Config(
         safety=safety,
         thresholds=thresholds,
         tags=tags,
         darktable=darktable,
         sensor=sensor,
+        autotag=autotag,
         config_path=config_path,
     )
 

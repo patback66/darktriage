@@ -140,7 +140,9 @@ def suggest_thresholds(
 
 
 def _toml_value(value) -> str:
-    """Render a scalar as TOML (json scalars are valid TOML scalars)."""
+    """Render a scalar (or list of scalars) as TOML."""
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -199,6 +201,13 @@ def render_config(
                 f"iso_blur_above = {_toml_value(config.sensor.iso_blur_above)}",
                 f"region_center_fraction = {_toml_value(config.sensor.region_center_fraction)}",
             ]
+        ),
+        "[autotag]\n"
+        + f"merge = {_toml_value(config.autotag.merge)}",
+        "[autotag.aliases]\n"
+        + "\n".join(
+            f"{key} = {_toml_value(list(values))}"
+            for key, values in config.autotag.aliases.items()
         ),
     ]
     return "\n\n".join(blocks) + "\n"
