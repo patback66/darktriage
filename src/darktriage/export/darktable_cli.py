@@ -11,7 +11,7 @@ import logging
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from darktriage.core.xmp_writer import read_sidecar_rating, xmp_sidecar_path
 
@@ -77,12 +77,16 @@ def batch_export(
     output_dir: Optional[str] = None,
     dry_run: bool = False,
     darktable_cli: str = "darktable-cli",
+    on_progress: Optional[Callable[[ExportJob], None]] = None,
 ) -> ExportResult:
     """Export .NEF files rated >= min_rating to an isolated output directory.
 
     Outputs land in ``output_dir`` (default ``<target_dir>/exported``), so the
     source RAW/JPEG files are never overwritten.  Multiple styles are applied
     in the order given; width/height set explicit output resolution.
+
+    ``on_progress``, if given, is called after each exported job completes
+    (useful for driving a progress bar).
     """
     directory = Path(target_dir)
     if not directory.is_dir():
@@ -114,6 +118,8 @@ def batch_export(
         command = build_command(job, styles, width, height, darktable_cli)
         result.commands.append(command)
         if dry_run:
+            if on_progress:
+                on_progress(job)
             continue
 
         logger.info("darktable-cli: %s", " ".join(command))
@@ -125,5 +131,7 @@ def batch_export(
             )
             logger.warning(message)
             result.errors.append(message)
+        if on_progress:
+            on_progress(job)
 
     return result

@@ -13,10 +13,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Tuple, Union, cast
 
 import cv2
 import numpy as np
@@ -263,26 +264,42 @@ def score_images(
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
     center_fraction: float = 0.6,
     workers: Optional[int] = None,
+    on_complete: Optional[Callable[[], None]] = None,
 ) -> List[Score]:
     """Score several JPEG previews in parallel.
 
     ``items`` is a list of ``(path, iso, orientation)`` triples so that each
-    file's metadata is respected.
+    file's metadata is respected.  ``on_complete``, if given, is called once
+    for every file as it finishes (useful for driving a progress bar).
+    Results are returned in input order.
     """
     paths = [(str(p), iso, orient) for p, iso, orient in items]
     if not paths:
         return []
     worker_count = workers or min((os.cpu_count() or 1), len(paths))
     if worker_count <= 1 or len(paths) == 1:
-        return [
+        results = [
             score_image(path, max_dim=max_dim, iso=iso, orientation=orientation,
                        center_fraction=center_fraction)
             for path, iso, orientation in paths
         ]
+        if on_complete:
+            for _ in results:
+                on_complete()
+        return results
     payloads = [(p, iso, orient, max_dim, center_fraction) for p, iso, orient in paths]
+    results: List[Optional[Score]] = [None] * len(payloads)
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        results = list(executor.map(_score_job, payloads))
-    return results
+        future_to_index = {
+            executor.submit(_score_job, payload): i
+            for i, payload in enumerate(payloads)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            results[idx] = future.result()
+            if on_complete:
+                on_complete()
+    return [cast(Score, r) for r in results]  # type: ignore[return-value]
 
 
 def _score_job(payload: Tuple[str, Optional[int], int, int, float]) -> Score:

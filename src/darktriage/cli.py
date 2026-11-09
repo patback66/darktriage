@@ -11,9 +11,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from darktriage.config import Config, load_config
@@ -23,14 +33,22 @@ from darktriage.core.exif_reader import (
     discover_pairs,
     select_burst_winners,
 )
-from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM, score_images
+from darktriage.core.metrics import (
+    DEFAULT_PROXY_MAX_DIM,
+    load_image_metadata,
+    score_images,
+)
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
     SidecarRequest,
     XmpWriter,
     derive_rating_and_label,
 )
-from darktriage.export.darktable_cli import batch_export
+from darktriage.export.darktable_cli import (
+    batch_export,
+    read_sidecar_rating,
+    xmp_sidecar_path,
+)
 
 __all__ = ["build_parser", "main"]
 
@@ -129,15 +147,18 @@ def _analyze_directory(
     threshold_seconds: Optional[float] = None,
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
     workers: Optional[int] = None,
+    progress: Optional[Progress] = None,
+    score_task_id: Optional[int] = None,
 ) -> List[Assessment]:
     """Score every .NEF/.JPG pair and return per-file assessments.
 
     ISO and orientation metadata is read per preview and passed through the
     scoring pipeline (noise filtering, auto-rotation, central-region masking)
     so results are camera-configurable rather than hardcoded.
-    """
-    from darktriage.core.metrics import load_image_metadata, score_image
 
+    If ``progress`` and ``score_task_id`` are supplied, the scoring progress
+    bar is advanced as each file finishes.
+    """
     pairs = discover_pairs(directory)
     gap = (
         threshold_seconds
@@ -152,11 +173,17 @@ def _analyze_directory(
     for pair in jpg_pairs:
         meta = load_image_metadata(pair.jpg_path)
         items.append((pair.jpg_path, meta.iso, meta.orientation))
+
+    def _advance_scoring() -> None:
+        if progress is not None and score_task_id is not None:
+            progress.update(score_task_id, advance=1)
+
     scores = score_images(
         items,
         max_dim=max_dim,
         center_fraction=config.sensor.region_center_fraction,
         workers=workers,
+        on_complete=_advance_scoring,
     )
     score_by_path = {p.jpg_path: s for p, s in zip(jpg_pairs, scores)}
 
@@ -248,13 +275,35 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
 
 
 def cmd_analyze(args) -> int:
-    assessments = _analyze_directory(
-        args.dir,
-        args.config,
-        threshold_seconds=args.burst_threshold,
-        max_dim=args.max_dim,
-        workers=getattr(args, "threads", None),
+    jpg_count = len(
+        [p for p in discover_pairs(args.dir) if p.jpg_path is not None]
     )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        score_task = progress.add_task("Scoring images", total=jpg_count)
+
+        assessments = _analyze_directory(
+            args.dir,
+            args.config,
+            threshold_seconds=args.burst_threshold,
+            max_dim=args.max_dim,
+            workers=getattr(args, "threads", None),
+            progress=progress,
+            score_task_id=score_task,
+        )
+        progress.update(score_task, completed=jpg_count)
+        progress.stop_task(score_task)
+        progress.refresh()
+
     _render_assessment_table(assessments, f"DarkTriage analysis: {args.dir}")
 
     if args.dry_run or args.config.safety.dry_run:
@@ -283,7 +332,29 @@ def cmd_analyze(args) -> int:
         console.print(f"[yellow]{exc}[/yellow]")
         return 1
 
-    results = writer.write_batch(requests)
+    if not requests:
+        console.print("[dim]no sidecars to write[/dim]")
+        return 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        write_task = progress.add_task("Writing XMP sidecars", total=len(requests))
+
+        def _advance_writing() -> None:
+            progress.update(write_task, advance=1)
+
+        results = writer.write_batch(requests, on_complete=_advance_writing)
+        progress.update(write_task, completed=len(requests))
+        progress.stop_task(write_task)
+        progress.refresh()
+
     written = sum(1 for r in results if r.success and not r.skipped)
     preserved = sum(1 for r in results if r.skipped)
     summary = f"[green]Wrote XMP sidecars for {written} file(s)[/green]"
@@ -311,16 +382,45 @@ def cmd_tui(args) -> int:
 
 
 def cmd_export(args) -> int:
-    result = batch_export(
-        args.dir,
-        min_rating=args.min_rating,
-        styles=args.styles,
-        width=args.width,
-        height=args.height,
-        output_dir=args.output,
-        dry_run=args.dry_run,
-        darktable_cli=args.config.darktable.cli_path,
-    )
+    directory = Path(args.dir)
+    nef_files = sorted(directory.glob("*.NEF")) + sorted(directory.glob("*.nef"))
+
+    # Pre-count eligible jobs so the progress bar is determinate.
+    eligible = 0
+    for nef in nef_files:
+        rating = read_sidecar_rating(xmp_sidecar_path(nef))
+        if rating is not None and rating >= args.min_rating:
+            eligible += 1
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        export_task = progress.add_task("Exporting frames", total=eligible)
+
+        def _advance_export(job) -> None:  # noqa: ARG001
+            progress.update(export_task, advance=1)
+
+        result = batch_export(
+            args.dir,
+            min_rating=args.min_rating,
+            styles=args.styles,
+            width=args.width,
+            height=args.height,
+            output_dir=args.output,
+            dry_run=args.dry_run,
+            darktable_cli=args.config.darktable.cli_path,
+            on_progress=_advance_export,
+        )
+        progress.update(export_task, completed=eligible)
+        progress.stop_task(export_task)
+        progress.refresh()
 
     console.print(
         f"Exported {len(result.jobs)} frame(s); "

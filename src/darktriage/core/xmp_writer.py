@@ -14,7 +14,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Union
+from typing import Callable, Iterable, List, Optional, Union
 
 from darktriage.config import Tags, Thresholds
 
@@ -259,7 +259,12 @@ class XmpWriter:
             stderr=proc.stderr,
         )
 
-    def write_batch(self, requests: Iterable[SidecarRequest]) -> List[WriteResult]:
+    def write_batch(
+        self,
+        requests: Iterable[SidecarRequest],
+        *,
+        on_complete: Optional[Callable[[], None]] = None,
+    ) -> List[WriteResult]:
         """Write many sidecars in a single exiftool invocation.
 
         Independent tag groups are joined with exiftool's ``-execute``
@@ -303,6 +308,8 @@ class XmpWriter:
                         proc.returncode,
                         stderr.strip(),
                     )
+            if on_complete:
+                on_complete()
 
         ordered: List[WriteResult] = []
         for request in requests:
