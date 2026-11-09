@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from darktriage.config import Config
 from darktriage.core.exif_reader import Assessment
-from darktriage.core.xmp_writer import ExifToolNotFoundError, XmpWriter
+from darktriage.core.xmp_writer import (
+    ExifToolNotFoundError,
+    SidecarRequest,
+    XmpWriter,
+)
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
@@ -34,10 +39,12 @@ class DarkTriageApp(App):
         self,
         assessments: Optional[List[Assessment]] = None,
         directory: Optional[str] = None,
+        config: Optional[Config] = None,
     ):
         super().__init__()
         self.assessments = list(assessments or [])
         self.directory = directory or ""
+        self.config = config
         self.selected: Optional[Assessment] = None
 
     def compose(self) -> ComposeResult:
@@ -79,20 +86,28 @@ class DarkTriageApp(App):
             self._refresh_metrics()
 
     def _commit_sidecars(self) -> None:
+        create_backup = self.config.safety.create_backup if self.config else True
         try:
-            writer = XmpWriter()
+            writer = XmpWriter(create_backup=create_backup)
         except ExifToolNotFoundError as exc:
             self.notify(str(exc), severity="error")
             return
 
-        written = 0
-        for assessment in self.assessments:
-            if assessment.rating is None:
-                continue
-            result = writer.write(
-                assessment.raw_path, assessment.rating, assessment.label
+        requests = [
+            SidecarRequest(
+                raw_path=a.raw_path,
+                rating=a.rating,
+                label=a.label,
+                ev_offset=a.ev_offset,
             )
-            if result.success:
-                written += 1
+            for a in self.assessments
+            if a.rating is not None
+        ]
+        results = writer.write_batch(requests)
+        written = sum(1 for r in results if r.success and not r.skipped)
+        preserved = sum(1 for r in results if r.skipped)
 
-        self.notify(f"Committed XMP sidecars for {written} file(s)")
+        message = f"Committed XMP sidecars for {written} file(s)"
+        if preserved:
+            message += f", preserved {preserved} existing sidecar(s)"
+        self.notify(message)

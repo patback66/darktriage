@@ -217,6 +217,7 @@ class Assessment:
     composition_score: Optional[float] = None
     mean_luminance: Optional[float] = None
     clipped_highlight_pct: Optional[float] = None
+    ev_offset: Optional[float] = None
     rating: Optional[int] = None
     label: Optional[str] = None
     error: Optional[str] = None

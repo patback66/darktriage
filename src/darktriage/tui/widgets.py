@@ -42,6 +42,7 @@ class MetricsView(Vertical):
             ("Composition", f"{assessment.composition_score:.2f}"),
             ("Mean luminance", f"{assessment.mean_luminance:.1f}"),
             ("Clipped highlights", f"{assessment.clipped_highlight_pct:.1f}%"),
+            ("EV offset", f"{assessment.ev_offset:+.2f}" if assessment.ev_offset is not None else "-"),
             ("Burst", burst),
         ]
         for name, value in rows:

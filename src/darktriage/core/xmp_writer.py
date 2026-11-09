@@ -1,32 +1,41 @@
-"""ExifTool-based XMP sidecar writer for DarkTriage.
+"""Non-destructive ExifTool XMP sidecar writer for DarkTriage.
 
-Writes non-destructive Darktable/Adobe XMP tags (Rating + Label) to
-``<raw>.xmp`` sidecars via the ExifTool command line.
+Writes Darktable/Adobe XMP tags (Rating, Label, Description) to ``<raw>.xmp``
+sidecars only - raw binaries (.NEF/.JPG) are never passed to ExifTool for
+writing.  By default, an existing sidecar that already carries a user rating
+or darktable edit history is preserved unless overwrite is explicitly set.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
+
+from darktriage.config import Tags, Thresholds
 
 logger = logging.getLogger(__name__)
 
-# Darktable label names written to the XMP-xmp:Label tag.
-LABEL_RED = "Red"
-LABEL_YELLOW = "Yellow"
-LABEL_GREEN = "Green"
-LABEL_PURPLE = "Purple"
+_XMP_RATING_XML_RE = re.compile(r"<xmp:Rating>\s*([0-5])\s*</xmp:Rating>")
+_XMP_RATING_ATTR_RE = re.compile(r'xmp:Rating=["\']([0-5])["\']')
+_DARKTABLE_HISTORY_RE = re.compile(r"<darktable:history")
 
-# Tunable thresholds for deriving a rating decision.  Tenengrad values are
-# resolution-normalised by the 1920px proxy produced in metrics.prepare_proxy.
-SHARPNESS_HIGH = 250.0
-SHARPNESS_LOW = 40.0
-COMPOSITION_STRONG = 0.6
-CLIP_PCT_THRESHOLD = 5.0
+# Minimal valid XMP pack used to create a brand-new sidecar file.
+MINIMAL_XMP = (
+    '<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
+    ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+    '  <rdf:Description rdf:about=""\n'
+    '    xmlns:dc="http://purl.org/dc/elements/1.1/"\n'
+    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"/>\n'
+    ' </rdf:RDF>\n'
+    '</x:xmpmeta>\n'
+    '<?xpacket end="w"?>\n'
+)
 
 
 class ExifToolNotFoundError(RuntimeError):
@@ -35,22 +44,28 @@ class ExifToolNotFoundError(RuntimeError):
 
 @dataclass(frozen=True)
 class RatingDecision:
-    """Star rating and colour label derived from scored metrics."""
-
     rating: int
-    label: Optional[str]  # None means no label
+    label: Optional[str]
 
 
 @dataclass(frozen=True)
 class WriteResult:
-    """Outcome of a single XMP sidecar write."""
-
     raw_path: Path
     rating: Optional[int]
     label: Optional[str]
     command: List[str]
     success: bool
     stderr: str = ""
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class SidecarRequest:
+    raw_path: Path
+    rating: Optional[int]
+    label: Optional[str]
+    ev_offset: Optional[float] = None
+    overwrite: bool = False
 
 
 def xmp_sidecar_path(raw_path: Union[str, Path]) -> Path:
@@ -58,54 +73,97 @@ def xmp_sidecar_path(raw_path: Union[str, Path]) -> Path:
     return Path(str(raw_path) + ".xmp")
 
 
+def read_sidecar_rating(xmp_path: Union[str, Path]) -> Optional[int]:
+    """Read the existing ``xmp:Rating`` (or None) from a sidecar."""
+    try:
+        text = Path(xmp_path).read_text(errors="replace")
+    except OSError:
+        return None
+    match = _XMP_RATING_XML_RE.search(text) or _XMP_RATING_ATTR_RE.search(text)
+    return int(match.group(1)) if match else None
+
+
+def has_darktable_history(xmp_path: Union[str, Path]) -> bool:
+    """Return True if the sidecar contains darktable edit history modules."""
+    try:
+        text = Path(xmp_path).read_text(errors="replace")
+    except OSError:
+        return False
+    return bool(_DARKTABLE_HISTORY_RE.search(text))
+
+
+def should_write_xmp(xmp_path: Union[str, Path], overwrite: bool = False) -> bool:
+    """Return True if it is safe/allowed to write the sidecar.
+
+    Non-destructive default: if a sidecar exists and already contains a user
+    rating (>0) or darktable history entries, refuse to write unless
+    ``overwrite=True``.
+    """
+    path = Path(xmp_path)
+    if not path.exists():
+        return True
+    if overwrite:
+        return True
+    if has_darktable_history(path):
+        return False
+    rating = read_sidecar_rating(path)
+    if rating is not None and rating > 0:
+        return False
+    return True
+
+
+def backup_sidecar(xmp_path: Union[str, Path]) -> Optional[Path]:
+    """Copy an existing sidecar to ``<file>.xmp.bak`` before modification."""
+    path = Path(xmp_path)
+    if not path.exists():
+        return None
+    backup = Path(str(path) + ".bak")
+    shutil.copy2(path, backup)
+    return backup
+
+
 def derive_rating_and_label(
     *,
     sharpness: float,
     composition_score: float,
-    clipped_pct: float,
-    is_burst_winner: bool = False,
+    clipped_fraction: float,
+    is_burst_winner: bool,
+    thresholds: Thresholds,
+    tags: Tags,
 ) -> RatingDecision:
-    """Map scored metrics onto the DarkTriage rating/label rule set.
-
-    Rules (evaluated in order):
-
-    * burst winner + high sharpness + strong composition -> 5 stars, Purple
-    * crisp focus / keeper -> 4 stars, Green
-    * soft focus / blur -> 1 star, Red
-    * otherwise -> 3 stars, no label
-    * highlight clipping > 5% overrides the label to Yellow
-    """
+    """Map scored metrics onto the configured rating/label rule set."""
     if (
         is_burst_winner
-        and sharpness >= SHARPNESS_HIGH
-        and composition_score >= COMPOSITION_STRONG
+        and sharpness >= thresholds.tenengrad_sharp
+        and composition_score >= thresholds.composition_min
     ):
-        rating, label = 5, LABEL_PURPLE
-    elif sharpness >= SHARPNESS_HIGH:
-        rating, label = 4, LABEL_GREEN
-    elif sharpness <= SHARPNESS_LOW:
-        rating, label = 1, LABEL_RED
+        rating, label = 5, tags.portfolio
+    elif sharpness >= thresholds.tenengrad_sharp:
+        rating, label = 4, tags.keeper
+    elif sharpness <= thresholds.tenengrad_blur:
+        rating, label = 1, tags.blur
     else:
         rating, label = 3, None
 
-    if clipped_pct > CLIP_PCT_THRESHOLD:
-        label = LABEL_YELLOW
+    if clipped_fraction > thresholds.highlight_clip_percent:
+        label = tags.exposure_warn
 
     return RatingDecision(rating=rating, label=label)
 
-
 class XmpWriter:
-    """Wrapper around the exiftool command line."""
+    """Wrapper around the exiftool command line (sidecar-only writes)."""
 
     def __init__(
         self,
         exiftool: str = "exiftool",
         *,
         dry_run: bool = False,
+        create_backup: bool = True,
         verbose: bool = False,
     ):
         self.exiftool = self._resolve(exiftool)
         self.dry_run = dry_run
+        self.create_backup = create_backup
         self.verbose = verbose
 
     @staticmethod
@@ -121,24 +179,53 @@ class XmpWriter:
         return exiftool
 
     @staticmethod
-    def _build_args(rating: int, label: Optional[str]) -> List[str]:
+    def _description(ev_offset: Optional[float]) -> Optional[str]:
+        if ev_offset is None:
+            return None
+        return f"darktriage recommended EV offset: {ev_offset:+.2f}"
+
+    def _build_args(
+        self, rating: int, label: Optional[str], ev_offset: Optional[float]
+    ) -> List[str]:
         args = [f"-XMP-xmp:Rating={rating}"]
-        # Write an empty label when none is requested to clear any previous
-        # label left from an earlier run.
+        # Write an empty label when none is requested to clear any stale label.
         args.append(f"-XMP-xmp:Label={label if label else ''}")
+        description = self._description(ev_offset)
+        if description:
+            args.append(f"-XMP-dc:Description={description}")
         args.append("-overwrite_original")
         return args
+
+    def _ensure_sidecar(self, xmp_path: Path) -> None:
+        if not xmp_path.exists() and not self.dry_run:
+            xmp_path.write_text(MINIMAL_XMP, encoding="utf-8")
 
     def write(
         self,
         raw_path: Union[str, Path],
         rating: int,
         label: Optional[str] = None,
+        ev_offset: Optional[float] = None,
+        *,
+        overwrite: bool = False,
     ) -> WriteResult:
-        """Write Rating + Label XMP tags for a single raw path."""
+        """Write Rating/Label/Description to ``<raw>.xmp`` (sidecar only)."""
         raw_path = Path(raw_path)
-        args = self._build_args(rating, label)
-        command = [self.exiftool] + args + [str(raw_path)]
+        xmp_path = xmp_sidecar_path(raw_path)
+
+        if not should_write_xmp(xmp_path, overwrite=overwrite):
+            logger.info("Preserving existing sidecar for %s", raw_path)
+            return WriteResult(
+                raw_path=raw_path,
+                rating=rating,
+                label=label,
+                command=[],
+                success=True,
+                skipped=True,
+            )
+
+        args = self._build_args(rating, label, ev_offset)
+        command = [self.exiftool] + args + [str(xmp_path)]
 
         if self.verbose:
             logger.info("exiftool: %s", " ".join(command))
@@ -151,12 +238,16 @@ class XmpWriter:
                 success=True,
             )
 
+        if self.create_backup and xmp_path.exists():
+            backup_sidecar(xmp_path)
+        self._ensure_sidecar(xmp_path)
+
         proc = subprocess.run(command, capture_output=True, text=True)
         if proc.returncode != 0:
             logger.warning(
                 "exiftool failed (%s) for %s: %s",
                 proc.returncode,
-                raw_path,
+                xmp_path,
                 proc.stderr.strip(),
             )
         return WriteResult(
@@ -168,8 +259,74 @@ class XmpWriter:
             stderr=proc.stderr,
         )
 
-    def write_decision(
-        self, raw_path: Union[str, Path], decision: RatingDecision
-    ) -> WriteResult:
-        """Write a RatingDecision to ``raw_path``."""
-        return self.write(raw_path, decision.rating, decision.label)
+    def write_batch(self, requests: Iterable[SidecarRequest]) -> List[WriteResult]:
+        """Write many sidecars in a single exiftool invocation.
+
+        Independent tag groups are joined with exiftool's ``-execute``
+        separator to minimise process-spawn overhead.  Sidecars protected by
+        ``should_write_xmp`` are skipped without touching the file.
+        """
+        requests = list(requests)
+        runnable: List[SidecarRequest] = []
+        runnable_paths = set()
+
+        for request in requests:
+            xmp_path = xmp_sidecar_path(request.raw_path)
+            if not should_write_xmp(xmp_path, overwrite=request.overwrite):
+                continue
+            runnable.append(request)
+            runnable_paths.add(xmp_path)
+
+        command: List[str] = [self.exiftool]
+        for index, request in enumerate(runnable):
+            if index > 0:
+                command.append("-execute")
+            xmp_path = xmp_sidecar_path(request.raw_path)
+            if self.create_backup and not self.dry_run and xmp_path.exists():
+                backup_sidecar(xmp_path)
+            self._ensure_sidecar(xmp_path)
+            command.extend(
+                self._build_args(request.rating, request.label, request.ev_offset)
+            )
+            command.append(str(xmp_path))
+
+        success, stderr = True, ""
+        if runnable:
+            if self.verbose:
+                logger.info("exiftool: %s", " ".join(command))
+            if not self.dry_run:
+                proc = subprocess.run(command, capture_output=True, text=True)
+                success, stderr = proc.returncode == 0, proc.stderr
+                if not success:
+                    logger.warning(
+                        "exiftool batch failed (%s): %s",
+                        proc.returncode,
+                        stderr.strip(),
+                    )
+
+        ordered: List[WriteResult] = []
+        for request in requests:
+            xmp_path = xmp_sidecar_path(request.raw_path)
+            if xmp_path not in runnable_paths:
+                ordered.append(
+                    WriteResult(
+                        raw_path=request.raw_path,
+                        rating=request.rating,
+                        label=request.label,
+                        command=[],
+                        success=True,
+                        skipped=True,
+                    )
+                )
+            else:
+                ordered.append(
+                    WriteResult(
+                        raw_path=request.raw_path,
+                        rating=request.rating,
+                        label=request.label,
+                        command=command,
+                        success=success,
+                        stderr=stderr,
+                    )
+                )
+        return ordered

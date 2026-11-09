@@ -2,7 +2,7 @@
 
 Commands:
 
-* ``darktriage analyze <dir>`` - headless scoring + XMP sidecar generation
+* ``darktriage analyze <dir>`` - headless scoring + non-destructive XMP writes
 * ``darktriage tui <dir>``     - interactive Textual dashboard
 * ``darktriage export <dir>``  - headless darktable-cli batch renderer
 """
@@ -16,16 +16,17 @@ from typing import List, Optional, Sequence
 from rich.console import Console
 from rich.table import Table
 
+from darktriage.config import Config, load_config
 from darktriage.core.exif_reader import (
-    DEFAULT_BURST_SECONDS,
     Assessment,
     detect_bursts,
     discover_pairs,
     select_burst_winners,
 )
-from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM, score_image
+from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM, score_images
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
+    SidecarRequest,
     XmpWriter,
     derive_rating_and_label,
 )
@@ -34,7 +35,6 @@ from darktriage.export.darktable_cli import batch_export
 __all__ = ["build_parser", "main"]
 
 console = Console()
-
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +44,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Headless RAW culling & batch post-processing engine for Darktable.",
     )
     parser.add_argument("--debug", action="store_true", help="enable debug logging")
+    parser.add_argument(
+        "--config", default=None, help="path to an alternate config.toml"
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="number of worker processes for scoring (default: CPU count)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -54,8 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--burst-threshold",
         type=float,
-        default=DEFAULT_BURST_SECONDS,
-        help="burst grouping window in seconds (default: 2.0)",
+        default=None,
+        help="burst grouping window in seconds (default from config)",
     )
     analyze.add_argument(
         "--max-dim",
@@ -64,17 +73,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="proxy long-edge size in pixels (default: 1920)",
     )
     analyze.add_argument(
-        "--dry-run", action="store_true", help="score but do not write XMP sidecars"
+        "--overwrite",
+        action="store_true",
+        help="explicitly allow modifying existing .xmp sidecars",
+    )
+    analyze.add_argument(
+        "--dry-run", action="store_true", help="preview ratings without writing files"
     )
     analyze.set_defaults(func=cmd_analyze)
 
     tui = sub.add_parser("tui", help="launch the interactive Textual dashboard")
     tui.add_argument("dir", help="directory containing .NEF/.JPG pairs")
     tui.add_argument(
-        "--burst-threshold",
-        type=float,
-        default=DEFAULT_BURST_SECONDS,
-        help="burst grouping window in seconds (default: 2.0)",
+        "--burst-threshold", type=float, default=None, help="burst window in seconds"
     )
     tui.add_argument(
         "--max-dim",
@@ -88,11 +99,21 @@ def build_parser() -> argparse.ArgumentParser:
         "export", help="run the headless darktable-cli batch renderer"
     )
     export.add_argument("dir", help="directory containing .NEF files and .xmp sidecars")
-    export.add_argument("--style", default=None, help="darktable style to apply")
+    export.add_argument(
+        "--style",
+        action="append",
+        default=None,
+        dest="styles",
+        help="darktable style to apply (repeatable for chained styles)",
+    )
     export.add_argument(
         "--min-rating", type=int, default=4, help="minimum rating to export (default: 4)"
     )
-    export.add_argument("--output", default=None, help="output directory for rendered JPEGs")
+    export.add_argument("--width", type=int, default=None, help="output width in pixels")
+    export.add_argument("--height", type=int, default=None, help="output height in pixels")
+    export.add_argument(
+        "--output", default=None, help="output directory (default: <dir>/exported)"
+    )
     export.add_argument(
         "--dry-run", action="store_true", help="plan exports without invoking darktable-cli"
     )
@@ -103,13 +124,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _analyze_directory(
     directory: str,
+    config: Config,
     *,
-    threshold_seconds: float = DEFAULT_BURST_SECONDS,
+    threshold_seconds: Optional[float] = None,
     max_dim: int = DEFAULT_PROXY_MAX_DIM,
+    workers: Optional[int] = None,
 ) -> List[Assessment]:
-    """Score every .NEF/.JPG pair in ``directory`` and return assessments."""
+    """Score every .NEF/.JPG pair in parallel and return assessments."""
     pairs = discover_pairs(directory)
-    groups = detect_bursts(pairs, threshold_seconds=threshold_seconds)
+    gap = (
+        threshold_seconds
+        if threshold_seconds is not None
+        else config.thresholds.burst_interval_sec
+    )
+    groups = detect_bursts(pairs, threshold_seconds=gap)
+
+    # Parallel computer-vision scoring of all previews at once.
+    jpg_pairs = [pair for pair in pairs if pair.jpg_path is not None]
+    scores = score_images(
+        [pair.jpg_path for pair in jpg_pairs], max_dim=max_dim, workers=workers
+    )
+    score_by_jpg = {
+        pair.jpg_path: score for pair, score in zip(jpg_pairs, scores)
+    }
+
+    # Seed sharpness so select_burst_winners reuses the parallel result.
+    for pair in jpg_pairs:
+        pair.sharpness = score_by_jpg[pair.jpg_path].sharpness
     select_burst_winners(groups)
 
     burst_index_of = {}
@@ -133,23 +174,25 @@ def _analyze_directory(
             assessments.append(assessment)
             continue
 
-        try:
-            score = score_image(pair.jpg_path, max_dim=max_dim)
-        except Exception as exc:  # noqa: BLE001 - corrupt preview -> error entry
-            assessment.error = f"scoring failed: {exc}"
+        score = score_by_jpg[pair.jpg_path]
+        if score.error:
+            assessment.error = score.error
             assessments.append(assessment)
             continue
 
         decision = derive_rating_and_label(
             sharpness=score.sharpness,
             composition_score=score.composition_score,
-            clipped_pct=score.clipped_highlight_pct,
+            clipped_fraction=score.clipped_highlight_pct / 100.0,
             is_burst_winner=assessment.is_burst_winner,
+            thresholds=config.thresholds,
+            tags=config.tags,
         )
         assessment.sharpness = score.sharpness
         assessment.composition_score = score.composition_score
         assessment.mean_luminance = score.mean_luminance
         assessment.clipped_highlight_pct = score.clipped_highlight_pct
+        assessment.ev_offset = score.ev_offset
         assessment.rating = decision.rating
         assessment.label = decision.label
         assessments.append(assessment)
@@ -164,6 +207,7 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
     table.add_column("label")
     table.add_column("sharpness")
     table.add_column("clipped")
+    table.add_column("ev")
     table.add_column("burst")
 
     for a in assessments:
@@ -172,7 +216,7 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
             burst = f"{a.burst_index}{'*' if a.is_burst_winner else ''}"
 
         if a.rating is None:
-            table.add_row(a.raw_path.name, "-", "-", "-", "-", burst)
+            table.add_row(a.raw_path.name, "-", "-", "-", "-", "-", burst)
         else:
             table.add_row(
                 a.raw_path.name,
@@ -180,6 +224,7 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
                 a.label or "",
                 f"{a.sharpness:.1f}",
                 f"{a.clipped_highlight_pct:.1f}%",
+                f"{a.ev_offset:+.2f}" if a.ev_offset is not None else "-",
                 burst,
             )
     console.print(table)
@@ -188,50 +233,60 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
 def cmd_analyze(args) -> int:
     assessments = _analyze_directory(
         args.dir,
+        args.config,
         threshold_seconds=args.burst_threshold,
         max_dim=args.max_dim,
+        workers=getattr(args, "threads", None),
     )
     _render_assessment_table(assessments, f"DarkTriage analysis: {args.dir}")
 
-    if args.dry_run:
-        console.print("[dim]--dry-run given: no XMP sidecars written[/dim]")
+    if args.dry_run or args.config.safety.dry_run:
+        console.print("[dim]dry-run: no XMP sidecars written[/dim]")
         return 0
 
+    requests = [
+        SidecarRequest(
+            raw_path=a.raw_path,
+            rating=a.rating,
+            label=a.label,
+            ev_offset=a.ev_offset,
+            overwrite=args.overwrite,
+        )
+        for a in assessments
+        if a.rating is not None
+    ]
+
     try:
-        writer = XmpWriter(verbose=args.debug)
+        writer = XmpWriter(
+            dry_run=False,
+            create_backup=args.config.safety.create_backup,
+            verbose=args.debug,
+        )
     except ExifToolNotFoundError as exc:
         console.print(f"[yellow]{exc}[/yellow]")
         return 1
 
-    written = 0
-    skipped = 0
-    for assessment in assessments:
-        if assessment.rating is None:
-            skipped += 1
-            continue
-        result = writer.write(
-            assessment.raw_path, assessment.rating, assessment.label
-        )
-        if result.success:
-            written += 1
-        else:
-            skipped += 1
-
+    results = writer.write_batch(requests)
+    written = sum(1 for r in results if r.success and not r.skipped)
+    preserved = sum(1 for r in results if r.skipped)
     summary = f"[green]Wrote XMP sidecars for {written} file(s)[/green]"
-    if skipped:
-        summary += f", skipped {skipped}"
+    if preserved:
+        summary += f", preserved {preserved} existing sidecar(s)"
     console.print(summary)
     return 0
 
-
 def cmd_tui(args) -> int:
     assessments = _analyze_directory(
-        args.dir, threshold_seconds=args.burst_threshold, max_dim=args.max_dim
+        args.dir,
+        args.config,
+        threshold_seconds=args.burst_threshold,
+        max_dim=args.max_dim,
+        workers=getattr(args, "threads", None),
     )
     try:
         from darktriage.tui.app import DarkTriageApp
 
-        DarkTriageApp(assessments=assessments, directory=args.dir).run()
+        DarkTriageApp(assessments=assessments, directory=args.dir, config=args.config).run()
     except ImportError as exc:
         console.print(f"[red]Textual is required for the TUI: {exc}[/red]")
         return 1
@@ -242,9 +297,12 @@ def cmd_export(args) -> int:
     result = batch_export(
         args.dir,
         min_rating=args.min_rating,
-        style_name=args.style,
+        styles=args.styles,
+        width=args.width,
+        height=args.height,
         output_dir=args.output,
         dry_run=args.dry_run,
+        darktable_cli=args.config.darktable.cli_path,
     )
 
     console.print(
@@ -261,6 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.WARNING)
+    args.config = load_config(args.config)
     return args.func(args)
 
 
