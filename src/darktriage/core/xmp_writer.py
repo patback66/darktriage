@@ -29,6 +29,15 @@ _DARKTABLE_HISTORY_RE = re.compile(r"<darktable:history")
 _SUBJECT_BAG_RE = re.compile(r"<dc:subject>(.*?)</dc:subject>", re.DOTALL | re.IGNORECASE)
 _SUBJECT_LI_RE = re.compile(r"<rdf:li[^>]*>(.*?)</rdf:li>", re.DOTALL | re.IGNORECASE)
 
+# Adobe/darktable colour-label vocabulary (case-sensitive capitalised names).
+_XMP_LABEL_NAMES = {
+    "red": "Red",
+    "yellow": "Yellow",
+    "green": "Green",
+    "blue": "Blue",
+    "purple": "Purple",
+}
+
 # Minimal valid XMP pack used to create a brand-new sidecar file.
 MINIMAL_XMP = (
     '<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
@@ -178,11 +187,13 @@ class XmpWriter:
         dry_run: bool = False,
         create_backup: bool = True,
         verbose: bool = False,
+        label_case: str = "title",
     ):
         self.exiftool = self._resolve(exiftool)
         self.dry_run = dry_run
         self.create_backup = create_backup
         self.verbose = verbose
+        self.label_case = label_case
 
     @staticmethod
     def _resolve(exiftool: str) -> str:
@@ -202,12 +213,23 @@ class XmpWriter:
             return None
         return f"darktriage recommended EV offset: {ev_offset:+.2f}"
 
+    def _xmp_label(self, label: Optional[str]) -> str:
+        """Render a configured colour label in the chosen XMP case style."""
+        if not label:
+            return ""
+        if self.label_case == "asis":
+            return label
+        if self.label_case == "lower":
+            return label.lower()
+        # default "title": Adobe/darktable vocabulary ("Green", "Purple", ...)
+        return _XMP_LABEL_NAMES.get(label.lower(), label)
+
     def _build_args(
         self, rating: int, label: Optional[str], ev_offset: Optional[float]
     ) -> List[str]:
         args = [f"-XMP-xmp:Rating={rating}"]
         # Write an empty label when none is requested to clear any stale label.
-        args.append(f"-XMP-xmp:Label={label if label else ''}")
+        args.append(f"-XMP-xmp:Label={self._xmp_label(label)}")
         description = self._description(ev_offset)
         if description:
             args.append(f"-XMP-dc:Description={description}")

@@ -147,7 +147,7 @@ def test_writer_targets_sidecar_only(tmp_path):
     args = result.command
     assert args[-1].endswith("DSC.NEF.xmp")
     assert "-XMP-xmp:Rating=5" in args
-    assert "-XMP-xmp:Label=red" in args
+    assert "-XMP-xmp:Label=Red" in args
     assert "-XMP-dc:Description=darktriage recommended EV offset: +0.50" in args
     assert "-overwrite_original" in args
 
@@ -211,3 +211,31 @@ def test_writer_raises_when_exiftool_missing(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     with pytest.raises(ExifToolNotFoundError):
         XmpWriter(exiftool="exiftool")
+
+def test_label_case_title_is_adobe_vocabulary():
+    writer = XmpWriter(exiftool="/exiftool", dry_run=True)
+    for configured, expected in (
+        ("green", "Green"),
+        ("purple", "Purple"),
+        ("yellow", "Yellow"),
+        ("red", "Red"),
+    ):
+        command = writer.write("D.NEF", rating=4, label=configured).command
+        assert f"-XMP-xmp:Label={expected}" in command
+
+
+def test_label_case_modes():
+    asis = XmpWriter(exiftool="/exiftool", dry_run=True, label_case="asis")
+    assert "-XMP-xmp:Label=green" in asis.write("D.NEF", 4, "green").command
+
+    lower = XmpWriter(exiftool="/exiftool", dry_run=True, label_case="lower")
+    assert "-XMP-xmp:Label=green" in lower.write("D.NEF", 4, "Green").command
+
+    unknown = XmpWriter(exiftool="/exiftool", dry_run=True)
+    # non-standard label names pass through unchanged
+    assert "-XMP-xmp:Label=Keeper" in unknown.write("D.NEF", 4, "Keeper").command
+
+
+def test_label_none_writes_empty_to_clear():
+    writer = XmpWriter(exiftool="/exiftool", dry_run=True)
+    assert "-XMP-xmp:Label=" in writer.write("D.NEF", 3, None).command

@@ -45,6 +45,7 @@ exposure_warn = "yellow"
 [darktable]
 cli_path = "darktable-cli"
 config_dir = "~/.config/darktable"
+label_case = "title"
 
 [sensor]
 iso_blur_above = 1600
@@ -92,6 +93,9 @@ class Tags:
 class Darktable:
     cli_path: str = "darktable-cli"
     config_dir: str = "~/.config/darktable"
+    # How colour-label names are written to XMP: "title" -> Adobe "Green",
+    # "lower" -> "green", "asis" -> exactly as configured.
+    label_case: str = "title"
 
 
 @dataclass(frozen=True)
@@ -161,6 +165,7 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Config:
     darktable = Darktable(
         cli_path=_value(darktable_raw, "cli_path", "darktable-cli"),
         config_dir=_value(darktable_raw, "config_dir", "~/.config/darktable"),
+        label_case=_value(darktable_raw, "label_case", "title"),
     )
     sensor = Sensor(
         iso_blur_above=_value(sensor_raw, "iso_blur_above", 1600),

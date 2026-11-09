@@ -191,6 +191,7 @@ def render_config(
             [
                 f"cli_path = {_toml_value(config.darktable.cli_path)}",
                 f"config_dir = {_toml_value(config.darktable.config_dir)}",
+                f"label_case = {_toml_value(config.darktable.label_case)}",
             ]
         ),
         "[sensor]\n"

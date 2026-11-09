@@ -328,6 +328,7 @@ exposure_warn = "yellow"
 [darktable]
 cli_path = "darktable-cli"
 config_dir = "~/.config/darktable"
+label_case = "title"           # write xmp:Label as Red/Yellow/Green/Purple
 
 [sensor]
 iso_blur_above = 1600          # apply 3x3 noise pre-filter above this ISO
@@ -337,6 +338,7 @@ region_center_fraction = 0.6   # central ROI used for focus/composition
 Notes:
 - Tenengrad thresholds depend on the proxy resolution (`--max-dim`) and image content; tune them against a folder of known keepers.
 - `highlight_clip_percent` is a **fraction** (`0.05` = 5%); `composition_min` is an **energy ratio** (off-centre ÷ centre), not a percentage.
+- Colour labels are written to XMP in **Adobe capitalisation** (`Red`/`Yellow`/`Green`/`Purple`) because darktable matches those names. Set `[darktable] label_case = "lower"` (or `"asis"`) if your darktable label names differ.
 - `write_default_config()` (Python API) drops the template above to disk.
 
 ## Performance & benchmarks
@@ -389,6 +391,8 @@ Tips for reading the numbers:
 - **`ExifToolNotFoundError`** — `exiftool` is not on `PATH`; install it (`brew install exiftool` / `apt install libimage-exiftool-perl`).
 - **`UnidentifiedImageError: .../._DSC1234.JPG`** — macOS AppleDouble sidecars. These are ignored automatically (names starting with `.`), so a folder copied to/from a Mac/exFAT volume is safe.
 - **No speedup from `--use-embedded-preview`** — check the RAW actually contains a usable preview: `exiftool -PreviewImage -JpgFromRaw file.NEF | head`. On large folders the ExifTool extraction pass itself can dominate and offset the decode savings.
+- **Ratings show in darktable but colour labels don't** — darktable matches Adobe capitalised names (`Red`/`Yellow`/`Green`/`Purple`). Ensure `[darktable] label_case = "title"`, re-run `analyze --overwrite` (existing sidecars are otherwise preserved), and confirm with `exiftool -Xmp:Label "<file>.NEF.xmp"`. If your darktable uses custom label names, set `label_case = "asis"` and put the exact names in `[tags]`.
+- **darktable doesn't see newly written sidecars** — enable *Preferences → “look for updated XMP files on startup”* (or re-import into a fresh library), then restart darktable.
 
 ## Development
 
