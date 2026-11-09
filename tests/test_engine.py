@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from darktriage.config import load_config
 from darktriage.core.engine import AnalysisOptions, analyze_directory, chunked
-from darktriage.core.exif_reader import ImagePair
+from darktriage.core.exif_reader import Assessment, ImagePair
 
 
 def _sharp_pattern() -> np.ndarray:
@@ -110,3 +111,27 @@ def test_singleton_frames_are_not_burst_winners(tmp_path):
     )
     assert len(assessments) == 2
     assert all(a.is_burst_winner is False for a in assessments)
+
+
+def test_summarize_assessments_counts():
+    from darktriage.core.engine import (
+        format_label_histogram,
+        format_rating_histogram,
+        summarize_assessments,
+    )
+
+    assessments = [
+        Assessment(raw_path=Path("a.NEF"), jpg_path=None, rating=5, label="purple"),
+        Assessment(raw_path=Path("b.NEF"), jpg_path=None, rating=1, label="red"),
+        Assessment(raw_path=Path("c.NEF"), jpg_path=None, rating=3, label=None),
+        Assessment(raw_path=Path("d.NEF"), jpg_path=None, rating=None),
+    ]
+    summary = summarize_assessments(assessments)
+    assert summary.total == 4
+    assert summary.rated == 3
+    assert summary.unscoreable == 1
+    assert summary.soft == 1
+    assert summary.by_rating[5] == 1 and summary.by_rating[3] == 1
+    assert summary.by_label["none"] == 1
+    assert "5★ 1" in format_rating_histogram(summary, percent=True)
+    assert "purple 1" in format_label_histogram(summary)

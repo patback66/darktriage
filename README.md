@@ -96,8 +96,9 @@ Scores every `.NEF`/`.JPG` pair in `<dir>` and, unless `--dry-run`, writes a `<f
 | `--overwrite` | Allow modifying existing sidecars (otherwise files with a user rating or darktable history are preserved). |
 | `--burst-threshold SEC` | Burst grouping window in seconds (default from config, `2.0`). |
 | `--max-dim PX` | Proxy long-edge size for scoring (default `1920`). |
-| `--use-embedded-preview` | Score the small JPEG embedded in each RAW instead of the full Fine JPEG (needs `exiftool`; falls back per-file). |
+| `--use-embedded-preview` | Score the small JPEG embedded in each RAW instead of the full Fine JPEG (needs `exiftool`; falls back per-file, and previews are cached). |
 | `--chunk-size N` | Files per parallel work chunk, bounds memory (default `256`). |
+| `--preview-cache-dir PATH` | Override the preview cache (default: per-folder `$XDG_CACHE_HOME/darktriage/previews`, reused across runs). |
 
 ```bash
 # Safe preview first, then commit
@@ -108,6 +109,8 @@ darktriage analyze "/path/to/shoot"
 darktriage --threads 8 analyze "/path/to/shoot" \
   --use-embedded-preview --overwrite
 ```
+
+After the table it prints a one-line **rating/label histogram** (e.g. `1★ 15% · 3★ 60% · 4★ 24% · 5★ 1%`, plus label counts) so you can sanity-check the calibrated mix at a glance.
 
 ### `darktriage tui <dir>`
 
@@ -120,7 +123,7 @@ Launches the interactive Textual dashboard. Pairing/EXIF/scoring run in a backgr
 | `--use-embedded-preview` | Score embedded RAW previews instead of Fine JPEGs. |
 | `--chunk-size N` | Files per parallel work chunk. |
 
-Press `q` to quit.
+Press `q` to quit. After analysis the dashboard shows the same one-line rating/label histogram, and the selected file's full metric breakdown.
 
 ### `darktriage export <dir>`
 
@@ -141,6 +144,45 @@ darktriage export "/path/to/shoot" --min-rating 4 \
 darktriage export "/path/to/shoot" --dry-run --min-rating 3
 ```
 
+### `darktriage calibrate <dir>`
+
+Derives rating thresholds from the **actual metric distribution** of a folder instead of the hard-coded defaults. It scores a sample with the blur early-exit disabled (so every image contributes sharpness, composition and clipping values), prints percentile tables, and suggests new `[thresholds]`.
+
+| Option | Description |
+| --- | --- |
+| `--sample N` | Score at most N images (default `300`; `0` = all). |
+| `--use-embedded-preview` | Calibrate against embedded previews (use this if you analyse with them). |
+| `--preview-cache-dir PATH` | Override the preview cache. |
+| `--max-dim PX` | Proxy long edge for scoring (default `1920`). |
+| `--blur-percentile` | Sharpness percentile → `tenengrad_blur` (default `15`). |
+| `--sharp-percentile` | Sharpness percentile → `tenengrad_sharp` (default `75`). |
+| `--composition-percentile` | Composition percentile → `composition_min` (default `60`). |
+| `--clip-percentile` | Clipping percentile → `highlight_clip_percent` (default `85`). |
+| `--write [PATH]` | Write the suggested thresholds to a config (default: the standard config path), backing the old file up to `.bak`. |
+
+```bash
+# inspect the distribution + suggestions (no changes)
+darktriage calibrate "/path/to/shoot" --sample 300
+
+# calibrate for embedded-preview scoring and save to config.toml
+darktriage calibrate "/path/to/shoot" --sample 500 --use-embedded-preview --write
+```
+
+> Calibrate on the **same source you analyse with** (Fine JPEG vs `--use-embedded-preview`): the embedded preview has a different resolution/compression, so its Tenengrad scale differs.
+
+It also reports how many sampled frames scored **zero sharpness** (a sign of blank/failed preview extracts) so you can spot data problems before trusting the bands.
+
+### `darktriage previews extract <dir>`
+
+Warms the embedded-preview cache ahead of time so the first `analyze`/TUI run is already fast. Prints how many previews are available and where the cache lives.
+
+```bash
+darktriage previews extract "/path/to/shoot"
+darktriage previews extract "/path/to/shoot" --preview-cache-dir /scratch/previews
+```
+
+Previews are cached under `${XDG_CACHE_HOME:-~/.cache}/darktriage/previews/<hash-of-folder>` and reused automatically by `--use-embedded-preview`.
+
 ## How scoring works
 
 For each `.NEF`/`.JPG` pair, `analyze` runs this pipeline:
@@ -148,7 +190,7 @@ For each `.NEF`/`.JPG` pair, `analyze` runs this pipeline:
 1. **Decode** the camera preview to grayscale at a reduced DCT scale (fast path), then **auto-rotate** it using the EXIF Orientation tag.
 2. If **ISO > `sensor.iso_blur_above`** (default 1600), apply a 3×3 Gaussian noise pre-filter.
 3. Compute **Tenengrad** (Sobel `Gx²+Gy²`) on the central `sensor.region_center_fraction` region (default 60%). If it is below `thresholds.tenengrad_blur`, the frame is flagged **soft/blur and exits early** (no composition/clipping work).
-4. Otherwise compute **composition** (off-centre ÷ centre grid energy) and **exposure** (mean luminance + clipped-highlight %), and derive a recommended **EV offset** `clamp(log2(128/mean), -2, +2)`.
+4. Otherwise compute **composition** (off-centre ÷ centre grid energy, clamped at 100 for stability) and **exposure** (mean luminance + clipped-highlight %), and derive a recommended **EV offset** `clamp(log2(128/mean), -2, +2)`.
 5. **Burst grouping**: shots within `thresholds.burst_interval_sec` are clustered; for each **multi-frame** burst the sharpest frame is the **winner** and gets +1 star (lone frames are not "winners").
 
 Ratings and labels are then derived from the configured thresholds:
@@ -231,6 +273,11 @@ python3 tests/benchmark_triage.py \
 python3 tests/benchmark_triage.py \
   --dir "/Volumes/Koken Pass/Photos/Hokkaido 2026" \
   --images 40 --workers 8 --use-embedded-preview
+
+# also run phases 1-3 on the previews, matching the analyze path end-to-end
+python3 tests/benchmark_triage.py \
+  --dir "/Volumes/Koken Pass/Photos/Hokkaido 2026" \
+  --images 40 --workers 8 --use-embedded-preview --bench-preview
 ```
 
 The report covers four phases:
@@ -243,7 +290,7 @@ The report covers four phases:
 Tips for reading the numbers:
 
 - **Decode is entropy-bound.** JPEG reduced-scale decode barely changes cost with output size (1/2 ≈ 1/4 ≈ 1/8 in testing) because the entire compressed scan must be entropy-decoded. The dominant cost is the *file size* (a 36 MP Fine JPEG is ~24 MB), not the proxy resolution — lowering `--max-dim` won't make it much faster.
-- **Embedded previews are the big lever.** `--use-embedded-preview` scores the ~1–3 MB JPEG most cameras embed in the RAW instead of the 24 MB Fine JPEG, cutting both I/O and decode. It requires `exiftool` and falls back per-file to the Fine JPEG when a RAW has no usable preview.
+- **Embedded previews are the big lever.** `--use-embedded-preview` scores the ~1–3 MB JPEG most cameras embed in the RAW instead of the 24 MB Fine JPEG, cutting both I/O and decode. It requires `exiftool`, falls back per-file to the Fine JPEG when a RAW has no usable preview, and caches extracted previews under `$XDG_CACHE_HOME/darktriage/previews` so repeat runs skip extraction.
 - **Parallel scaling** on a laptop is typically ~5× with 8 workers (performance + efficiency cores), not a clean 8×.
 
 ## Troubleshooting
@@ -271,6 +318,7 @@ src/darktriage/
 ├── config.py               # TOML config loading + defaults
 ├── core/
 │   ├── engine.py           # bounded parallel analysis engine (ProcessPool)
+│   ├── calibration.py      # data-driven threshold calibration
 │   ├── exif_reader.py      # EXIF parsing, pairing, burst detection
 │   ├── metrics.py          # fast decode, Tenengrad, composition, exposure
 │   ├── previews.py         # embedded RAW-preview extraction (ExifTool)

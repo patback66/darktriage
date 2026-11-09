@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -26,14 +28,28 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from darktriage.config import Config, load_config
+from darktriage.config import Config, default_config_path, load_config
+from darktriage.core.calibration import (
+    collect_scores,
+    render_config,
+    summarise,
+    suggest_thresholds,
+    write_config,
+)
 from darktriage.core.engine import (
     DEFAULT_CHUNK_SIZE,
     AnalysisOptions,
     analyze_directory,
+    format_label_histogram,
+    format_rating_histogram,
+    summarize_assessments,
 )
 from darktriage.core.exif_reader import Assessment, ImagePair, discover_pairs
 from darktriage.core.metrics import DEFAULT_PROXY_MAX_DIM
+from darktriage.core.previews import (
+    default_preview_cache_dir,
+    extract_previews,
+)
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
     SidecarRequest,
@@ -113,8 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "persistent dir for extracted embedded previews; reuse it across "
-            "runs so extraction cost is paid once (default: temp dir)"
+            "override the preview cache dir (default: per-folder "
+            "$XDG_CACHE_HOME/darktriage/previews, reused across runs)"
         ),
     )
     analyze.set_defaults(func=cmd_analyze)
@@ -145,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--preview-cache-dir",
         default=None,
         metavar="PATH",
-        help="persistent dir for extracted embedded previews (reused across runs)",
+        help="override the preview cache dir (default: per-folder XDG cache)",
     )
     tui.set_defaults(func=cmd_tui)
 
@@ -172,6 +188,52 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="plan exports without invoking darktable-cli"
     )
     export.set_defaults(func=cmd_export)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="derive rating thresholds from a folder's metric distribution",
+    )
+    calibrate.add_argument("dir", help="directory containing .NEF/.JPG pairs")
+    calibrate.add_argument(
+        "--sample", type=int, default=300,
+        help="score at most N images (0 = all; default 300)",
+    )
+    calibrate.add_argument("--max-dim", type=int, default=DEFAULT_PROXY_MAX_DIM)
+    calibrate.add_argument("--use-embedded-preview", action="store_true")
+    calibrate.add_argument("--preview-cache-dir", default=None, metavar="PATH")
+    calibrate.add_argument(
+        "--blur-percentile", type=float, default=15.0,
+        help="sharpness percentile used as tenengrad_blur (default 15)",
+    )
+    calibrate.add_argument(
+        "--sharp-percentile", type=float, default=75.0,
+        help="sharpness percentile used as tenengrad_sharp (default 75)",
+    )
+    calibrate.add_argument(
+        "--composition-percentile", type=float, default=60.0,
+        help="composition percentile used as composition_min (default 60)",
+    )
+    calibrate.add_argument(
+        "--clip-percentile", type=float, default=85.0,
+        help="clipped-highlight percentile used as highlight_clip_percent (default 85)",
+    )
+    calibrate.add_argument(
+        "--write", nargs="?", const="", default=None, metavar="PATH",
+        help="write suggested thresholds to config (default: standard config path)",
+    )
+    calibrate.set_defaults(func=cmd_calibrate)
+
+    previews = sub.add_parser("previews", help="manage embedded RAW previews")
+    previews_sub = previews.add_subparsers(dest="previews_command", required=True)
+    p_extract = previews_sub.add_parser(
+        "extract", help="extract embedded previews into the cache (warm it up)"
+    )
+    p_extract.add_argument("dir")
+    p_extract.add_argument(
+        "--preview-cache-dir", default=None, metavar="PATH",
+        help="cache dir (default: per-folder $XDG_CACHE_HOME/darktriage/previews)",
+    )
+    p_extract.set_defaults(func=cmd_previews_extract)
 
     return parser
 
@@ -240,6 +302,20 @@ def _render_assessment_table(assessments: List[Assessment], title: str) -> None:
     console.print(table)
 
 
+def _render_rating_summary(assessments: List[Assessment]) -> None:
+    """Print a one-line rating histogram and label counts for a batch."""
+    summary = summarize_assessments(assessments)
+    if summary.total == 0:
+        return
+    console.print(
+        f"  ratings: {format_rating_histogram(summary, percent=True)}"
+    )
+    if summary.by_label:
+        console.print(f"  labels:  {format_label_histogram(summary)}")
+    if summary.unscoreable:
+        console.print(f"  [yellow]unscoreable: {summary.unscoreable}[/yellow]")
+
+
 def cmd_analyze(args) -> int:
     pairs = discover_pairs(args.dir)
     use_embedded = getattr(args, "use_embedded_preview", False)
@@ -279,6 +355,7 @@ def cmd_analyze(args) -> int:
         progress.refresh()
 
     _render_assessment_table(assessments, f"DarkTriage analysis: {args.dir}")
+    _render_rating_summary(assessments)
 
     if args.dry_run or args.config.safety.dry_run:
         console.print("[dim]dry-run: no XMP sidecars written[/dim]")
@@ -406,6 +483,151 @@ def cmd_export(args) -> int:
     for error in result.errors:
         console.print(f"[red]{error}[/red]")
     return 0 if result.success else 1
+
+
+def cmd_calibrate(args) -> int:
+    pairs = discover_pairs(args.dir)
+    if not pairs:
+        console.print(f"[yellow]no .NEF/.JPG pairs found in {args.dir}[/yellow]")
+        return 1
+
+    selected = pairs if not args.sample or args.sample <= 0 else pairs[: args.sample]
+    use_preview = getattr(args, "use_embedded_preview", False)
+    total = (
+        len(selected)
+        if use_preview
+        else sum(1 for p in selected if p.jpg_path is not None)
+    )
+
+    options = AnalysisOptions(
+        max_dim=args.max_dim,
+        center_fraction=args.config.sensor.region_center_fraction,
+        iso_threshold=args.config.sensor.iso_blur_above,
+        workers=getattr(args, "threads", None),
+        use_embedded_preview=use_preview,
+        preview_cache_dir=getattr(args, "preview_cache_dir", None),
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task(
+            "Scoring (early-exit disabled)", total=max(1, total)
+        )
+
+        def _advance() -> None:
+            progress.update(task, advance=1)
+
+        scores = collect_scores(
+            selected, options, on_complete=_advance, directory=args.dir
+        )
+        progress.update(task, completed=max(1, total))
+        progress.stop_task(task)
+        progress.refresh()
+
+    if not scores:
+        console.print("[yellow]no scorable images for calibration[/yellow]")
+        return 1
+
+    zero_sharpness = sum(1 for s in scores if s.sharpness <= 0.0)
+
+    sharpness = summarise([s.sharpness for s in scores])
+    composition = summarise([s.composition_score for s in scores])
+    clipping = summarise([s.clipped_highlight_pct / 100.0 for s in scores])
+
+    source = "embedded previews" if use_preview else "Fine JPEGs"
+    distribution = Table(
+        title=f"Metric distribution ({len(scores)} images, {source})"
+    )
+    for column in ("metric", "min", "p10", "p25", "p50", "p75", "p90", "max"):
+        distribution.add_column(column, justify="right" if column != "metric" else "left")
+    for name, summary, pattern in (
+        ("sharpness", sharpness, "{:.1f}"),
+        ("composition", composition, "{:.2f}"),
+        ("clip fraction", clipping, "{:.4f}"),
+    ):
+        values = list(summary.as_dict().values())
+        distribution.add_row(name, *[pattern.format(v) for v in values])
+    console.print(distribution)
+
+    if zero_sharpness:
+        console.print(
+            f"  [yellow]{zero_sharpness} of {len(scores)} frame(s) have zero "
+            "sharpness[/yellow] — likely blank/failed preview extracts"
+        )
+
+    suggested = suggest_thresholds(
+        scores,
+        blur_percentile=args.blur_percentile,
+        sharp_percentile=args.sharp_percentile,
+        composition_percentile=args.composition_percentile,
+        clip_percentile=args.clip_percentile,
+        burst_interval_sec=args.config.thresholds.burst_interval_sec,
+    )
+
+    comparison = Table(title="Suggested thresholds")
+    comparison.add_column("key")
+    comparison.add_column("current", justify="right")
+    comparison.add_column("suggested", justify="right")
+    thresholds = args.config.thresholds
+    for key in (
+        "tenengrad_blur",
+        "tenengrad_sharp",
+        "composition_min",
+        "highlight_clip_percent",
+    ):
+        comparison.add_row(key, str(getattr(thresholds, key)), str(suggested[key]))
+    console.print(comparison)
+
+    if args.write is None:
+        console.print(
+            "[dim]pass --write (optionally a path) to save these thresholds[/dim]"
+        )
+    else:
+        target = Path(args.write) if args.write else default_config_path()
+        text = render_config(args.config, suggested)
+        written = write_config(target, text, backup=True)
+        console.print(f"[green]Wrote calibrated config to {written}[/green]")
+    return 0
+
+
+def cmd_previews_extract(args) -> int:
+    pairs = discover_pairs(args.dir)
+    raws = [p.raw_path for p in pairs if p.jpg_path is not None]
+    if not raws:
+        console.print(f"[yellow]no RAW/JPEG pairs found in {args.dir}[/yellow]")
+        return 1
+
+    cache = (
+        Path(args.preview_cache_dir)
+        if getattr(args, "preview_cache_dir", None)
+        else default_preview_cache_dir(args.dir)
+    )
+    cached_before = len(list(cache.glob("*.jpg"))) if cache.exists() else 0
+    workers = max(1, getattr(args, "threads", None) or (os.cpu_count() or 1))
+
+    with console.status(
+        f"Extracting previews for {len(raws)} RAW ({workers} workers)..."
+    ):
+        start = time.perf_counter()
+        previews = extract_previews(
+            raws, cache, workers=workers, reuse_existing=True
+        )
+        elapsed = time.perf_counter() - start
+
+    console.print(
+        f"[green]{len(previews)}/{len(raws)} previews available[/green] "
+        f"in {elapsed:.1f}s ({cached_before} already cached)"
+    )
+    console.print(f"cache: {cache}")
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

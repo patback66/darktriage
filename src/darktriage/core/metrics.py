@@ -36,6 +36,10 @@ MIN_EV_OFFSET = -2.0
 MAX_EV_OFFSET = 2.0
 EV_REFERENCE_LUMINANCE = 128.0
 
+# Upper clamp for the Rule-of-Thirds composition ratio (off-centre/centre grid
+# energy) so a near-empty centre cell cannot produce a runaway value.
+MAX_COMPOSITION_RATIO = 100.0
+
 
 @dataclass(frozen=True)
 class ExposureReport:
@@ -295,8 +299,9 @@ def compute_composition_score(gray_img: np.ndarray) -> float:
     """Rule-of-Thirds mass ratio (off-centre grid energy / centre energy).
 
     The image is split into a 3x3 cell grid and Sobel gradient energy is
-    summed per cell.  The returned ratio is unbounded (>= 0); a value above
-    1.2 means the majority of edge energy sits away from the centre.
+    summed per cell.  The ratio is clamped to ``MAX_COMPOSITION_RATIO`` so a
+    near-empty centre cell cannot produce a runaway value; a score above ~1.2
+    means most edge energy sits away from the centre.
     """
     if gray_img.size == 0:
         return 0.0
@@ -318,7 +323,8 @@ def compute_composition_score(gray_img: np.ndarray) -> float:
     if total <= 0.0:
         return 0.0
     off_centre = total - centre
-    return float(off_centre / (centre + 1e-9))
+    ratio = off_centre / (centre + 1e-9)
+    return float(min(ratio, MAX_COMPOSITION_RATIO))
 
 
 def check_exposure(gray_img: np.ndarray) -> ExposureReport:

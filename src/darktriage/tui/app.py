@@ -11,7 +11,12 @@ from typing import List, Optional
 
 from darktriage.cli import _analyze_directory
 from darktriage.config import Config
-from darktriage.core.engine import DEFAULT_CHUNK_SIZE
+from darktriage.core.engine import (
+    DEFAULT_CHUNK_SIZE,
+    format_label_histogram,
+    format_rating_histogram,
+    summarize_assessments,
+)
 from darktriage.core.exif_reader import Assessment, discover_pairs
 from darktriage.core.xmp_writer import (
     ExifToolNotFoundError,
@@ -49,6 +54,10 @@ class DarkTriageApp(App):
     #analyze-progress {
         height: 1;
         margin: 1 0;
+    }
+    #summary {
+        height: 1;
+        color: $text-muted;
     }
     #commit-progress {
         height: 1;
@@ -89,6 +98,7 @@ class DarkTriageApp(App):
         yield Header()
         yield Label("Analyzing images...", id="analyze-status")
         yield ProgressBar(id="analyze-progress", total=0, show_eta=False)
+        yield Label("", id="summary")
         with VerticalScroll(id="file-list"):
             pass  # populated after analysis completes
         with Vertical():
@@ -183,6 +193,15 @@ class DarkTriageApp(App):
         self._set_analysis_status(
             f"Analysis complete — {len(self.assessments)} file(s)"
         )
+
+        summary = summarize_assessments(self.assessments)
+        if summary.total:
+            text = format_rating_histogram(summary, percent=True)
+            if summary.by_label:
+                text += "  |  " + format_label_histogram(summary)
+            if summary.unscoreable:
+                text += f"  |  unscoreable {summary.unscoreable}"
+            self.query_one("#summary", Label).update(text)
 
         file_list = self.query_one("#file-list", VerticalScroll)
         file_list.remove_children()

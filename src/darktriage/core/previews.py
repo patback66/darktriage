@@ -13,7 +13,9 @@ runs skip extraction entirely.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +45,20 @@ _PREVIEW_CHUNK = 128
 
 class PreviewExtractionError(RuntimeError):
     """Raised when previews cannot be extracted (e.g. exiftool missing)."""
+
+
+def default_preview_cache_dir(directory: "Path | str") -> Path:
+    """Return a stable per-folder cache dir for embedded previews.
+
+    Uses ``$XDG_CACHE_HOME`` (or ``~/.cache``) plus a short hash of the
+    folder's absolute path so different shoots never collide and repeat runs
+    stay warm.
+    """
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    digest = hashlib.sha1(
+        str(Path(directory).resolve()).encode("utf-8")
+    ).hexdigest()[:12]
+    return Path(base) / "darktriage" / "previews" / digest
 
 
 def _valid_jpeg(path: Path, min_long_edge: int = 0) -> bool:
