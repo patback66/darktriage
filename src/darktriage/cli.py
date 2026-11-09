@@ -108,6 +108,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CHUNK_SIZE,
         help="files processed per parallel work chunk (bounds memory)",
     )
+    analyze.add_argument(
+        "--preview-cache-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "persistent dir for extracted embedded previews; reuse it across "
+            "runs so extraction cost is paid once (default: temp dir)"
+        ),
+    )
     analyze.set_defaults(func=cmd_analyze)
 
     tui = sub.add_parser("tui", help="launch the interactive Textual dashboard")
@@ -131,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_CHUNK_SIZE,
         help="files processed per parallel work chunk (bounds memory)",
+    )
+    tui.add_argument(
+        "--preview-cache-dir",
+        default=None,
+        metavar="PATH",
+        help="persistent dir for extracted embedded previews (reused across runs)",
     )
     tui.set_defaults(func=cmd_tui)
 
@@ -171,6 +186,7 @@ def _analyze_directory(
     on_complete: Optional[Callable[[], None]] = None,
     use_embedded_preview: bool = False,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    preview_cache_dir: Optional[str] = None,
     pairs: Optional[List[ImagePair]] = None,
 ) -> List[Assessment]:
     """Score every .NEF/.JPG pair via the bounded parallel engine."""
@@ -182,6 +198,7 @@ def _analyze_directory(
         workers=workers,
         chunk_size=chunk_size,
         use_embedded_preview=use_embedded_preview,
+        preview_cache_dir=preview_cache_dir,
     )
     return analyze_directory(
         directory,
@@ -254,6 +271,7 @@ def cmd_analyze(args) -> int:
             on_complete=_advance_scoring,
             use_embedded_preview=use_embedded,
             chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
+            preview_cache_dir=getattr(args, "preview_cache_dir", None),
             pairs=pairs,
         )
         progress.update(score_task, completed=total)
@@ -331,6 +349,7 @@ def cmd_tui(args) -> int:
             workers=getattr(args, "threads", None),
             use_embedded_preview=getattr(args, "use_embedded_preview", False),
             chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
+            preview_cache_dir=getattr(args, "preview_cache_dir", None),
         ).run()
     except ImportError as exc:
         console.print(f"[red]Textual is required for the TUI: {exc}[/red]")
