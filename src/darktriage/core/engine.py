@@ -15,13 +15,14 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from darktriage.config import Config
+from darktriage.core.autotag import DEFAULT_AUTOTAG_MAX_DIM, SubjectTagger
 from darktriage.core.exif_reader import (
     Assessment,
     ImagePair,
@@ -50,6 +51,8 @@ class AnalysisOptions:
     chunk_size: int = DEFAULT_CHUNK_SIZE
     use_embedded_preview: bool = False
     preview_cache_dir: Optional[str] = None
+    autotag: bool = False
+    autotag_max_dim: int = DEFAULT_AUTOTAG_MAX_DIM
 
 
 Payload = Tuple[str, Optional[int], int, AnalysisOptions]
@@ -74,7 +77,7 @@ def chunked(iterable, size: int) -> Iterator[list]:
 def _score_payload(payload: Payload) -> Score:
     """Worker entry point: decode + score a single image (JPEG preview)."""
     path, iso, orientation, options = payload
-    return score_image(
+    score = score_image(
         path,
         max_dim=options.max_dim,
         iso=iso,
@@ -83,6 +86,24 @@ def _score_payload(payload: Payload) -> Score:
         iso_threshold=options.iso_threshold,
         blur_threshold=options.blur_threshold,
     )
+    if options.autotag:
+        try:
+            tags = _tagger(options.autotag_max_dim).analyze(path).tags
+            score = replace(score, tags=tags)
+        except Exception as exc:  # noqa: BLE001 - tagging is best-effort
+            logger.warning("auto-tag failed for %s: %s", path, exc)
+    return score
+
+
+_TAGGERS: Dict[int, SubjectTagger] = {}
+
+
+def _tagger(max_dim: int) -> SubjectTagger:
+    tagger = _TAGGERS.get(max_dim)
+    if tagger is None:
+        tagger = SubjectTagger(max_dim=max_dim)
+        _TAGGERS[max_dim] = tagger
+    return tagger
 
 
 def _build_payload(
@@ -293,6 +314,7 @@ def analyze_directory(
         assessment.ev_offset = score.ev_offset
         assessment.rating = decision.rating
         assessment.label = decision.label
+        assessment.tags = score.tags
         assessments.append(assessment)
 
     return assessments
@@ -372,6 +394,7 @@ def assessment_to_dict(assessment: Assessment) -> dict:
         "ev_offset": assessment.ev_offset,
         "rating": assessment.rating,
         "label": assessment.label,
+        "tags": list(assessment.tags),
         "error": assessment.error,
     }
 
@@ -392,5 +415,6 @@ def assessment_from_dict(data: dict) -> Assessment:
         ev_offset=data.get("ev_offset"),
         rating=data.get("rating"),
         label=data.get("label"),
+        tags=tuple(data.get("tags") or ()),
         error=data.get("error"),
     )

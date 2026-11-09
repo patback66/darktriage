@@ -324,4 +324,5 @@ class Assessment:
     ev_offset: Optional[float] = None
     rating: Optional[int] = None
     label: Optional[str] = None
+    tags: Tuple[str, ...] = ()
     error: Optional[str] = None

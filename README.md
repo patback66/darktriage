@@ -11,6 +11,7 @@ DarkTriage scores camera JPEG previews in memory with local computer-vision heur
 - **Composition & exposure** — Rule-of-Thirds energy distribution, highlight clipping, plus a recommended EV offset written to `XMP-dc:Description`.
 - **Burst detection** — clusters continuous-drive shots by sub-second capture time and awards the sharpest frame in each burst a bonus star.
 - **Native Darktable XMP** — writes `XmpRating` / `XmpLabel` sidecars via `exiftool`; never touches RAW/JPEG binaries.
+- **Subject auto-tagging** — local heuristics (Haar faces + sky/vegetation colour) tag `people`/`portrait`/`group`/`landscape`/`nature`/`night` into XMP keywords, no model download.
 - **Non-destructive safety** — existing sidecars with a user rating or darktable history are preserved unless `--overwrite`; optional `.xmp.bak` backups.
 - **Bounded-memory parallel engine** — `ProcessPoolExecutor` across all cores with `itertools.islice` chunking.
 - **Optional embedded-preview scoring** — score the small JPEG embedded in each RAW instead of the full Fine JPEG (large speedups on big batches).
@@ -170,6 +171,7 @@ Scores every `.NEF`/`.JPG` pair in `<dir>` and, unless `--dry-run`, writes a `<f
 | `--use-embedded-preview` | Score the small JPEG embedded in each RAW instead of the full Fine JPEG (needs `exiftool`; falls back per-file, and previews are cached). |
 | `--chunk-size N` | Files per parallel work chunk, bounds memory (default `256`). |
 | `--preview-cache-dir PATH` | Override the preview cache (default: per-folder `$XDG_CACHE_HOME/darktriage/previews`, reused across runs). |
+| `--autotag` | Detect subject tags and write them to `dc:Subject` (additive; existing keywords kept). See [Subject auto-tagging](#subject-auto-tagging). |
 
 ```bash
 # Safe preview first, then commit
@@ -192,6 +194,7 @@ Launches the interactive Textual dashboard. Pairing/EXIF/scoring run in a backgr
 | `--burst-threshold SEC` | Burst window in seconds. |
 | `--max-dim PX` | Proxy long-edge size (default `1920`). |
 | `--use-embedded-preview` | Score embedded RAW previews instead of Fine JPEGs. |
+| `--autotag` | Detect subject tags and include them when committing sidecars. |
 | `--chunk-size N` | Files per parallel work chunk. |
 
 Press `q` to quit. After analysis the dashboard shows the same one-line rating/label histogram, and the selected file's full metric breakdown.
@@ -275,6 +278,22 @@ Ratings and labels are then derived from the configured thresholds:
 | Highlight clipping `> highlight_clip_percent` | — | yellow (overrides the label) |
 
 The EV offset is written to `XMP-dc:Description` for reference inside Darktable.
+
+## Subject auto-tagging
+
+`analyze --autotag` (and `tui --autotag`) derives subject tags from cheap, deterministic, local signals — no model downloads, no LLM:
+
+- **Faces** (OpenCV's bundled Haar cascade) → `people`, `portrait` (one large face), `group` (2+ faces).
+- **Scene colour/tonality** on a small colour proxy → `landscape` (sky present), `nature` (vegetation), `night` (low luminance).
+- Faces take precedence; scene tags are only added when no faces are found.
+
+Tags are written to the XMP `dc:subject` keyword list **additively** — existing user keywords are preserved and DarkTriage never removes them. They show up in darktable's tag list once it re-reads the sidecar.
+
+```bash
+darktriage analyze "$SHOOT" --use-embedded-preview --autotag --overwrite
+```
+
+Limits: object classes such as **cars** need a trained detector; these heuristics do not recognise vehicles (a pluggable OpenCV DNN hook is planned). Tagging is deliberately conservative — a tag is emitted only when a strong signal is present.
 
 ## Non-destructive safety
 
@@ -390,6 +409,7 @@ src/darktriage/
 ├── core/
 │   ├── engine.py           # bounded parallel analysis engine (ProcessPool)
 │   ├── calibration.py      # data-driven threshold calibration
+│   ├── autotag.py          # subject auto-tagging (faces + scene heuristics)
 │   ├── exif_reader.py      # EXIF parsing, pairing, burst detection
 │   ├── metrics.py          # fast decode, Tenengrad, composition, exposure
 │   ├── previews.py         # embedded RAW-preview extraction (ExifTool)

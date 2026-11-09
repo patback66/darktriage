@@ -55,6 +55,7 @@ class Score:
     clipped_highlight_pct: float
     ev_offset: float = 0.0
     early_exit: bool = False  # True when the blur early-exit path fired
+    tags: Tuple[str, ...] = ()  # subject auto-tags (when enabled)
     error: Optional[str] = None
 
 
