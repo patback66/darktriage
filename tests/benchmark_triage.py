@@ -320,11 +320,12 @@ def bench_engine(
     workers: int,
     use_embedded_preview: bool = False,
     image_map: Optional[dict] = None,
+    pairs: Optional[list] = None,
 ) -> EngineStats:
-    """Time a single full ``analyze_directory()`` pass (pairs + bursts + pool).
+    """Time a single full ``analyze_directory()`` pass (scoring stage).
 
-    When ``image_map`` is supplied the (expensive) preview extraction is not
-    counted here -- only scoring.
+    ``image_map`` and ``pairs`` let the caller exclude one-time preview
+    extraction and directory discovery from the measured scoring time.
     """
     config = load_config()
     options = AnalysisOptions(
@@ -332,12 +333,12 @@ def bench_engine(
         workers=workers,
         use_embedded_preview=use_embedded_preview and image_map is None,
     )
-    pair_count = len(discover_pairs(directory))
+    pair_count = len(pairs) if pairs is not None else len(discover_pairs(directory))
 
     gc.collect()
     start = time.perf_counter()
     assessments = analyze_directory(
-        str(directory), config, options, image_map=image_map
+        str(directory), config, options, image_map=image_map, pairs=pairs
     )
     seconds = time.perf_counter() - start
 
@@ -722,7 +723,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 }
 
             engine = bench_engine(
-                source_dir, args.max_dim, args.workers, image_map=image_map
+                source_dir,
+                args.max_dim,
+                args.workers,
+                image_map=image_map,
+                pairs=pairs,
             )
             print(f"      {rate_line(engine.timing)}")
             print(

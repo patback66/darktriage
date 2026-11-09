@@ -96,3 +96,17 @@ def test_analyze_uses_image_map_without_jpeg(tmp_path):
     assert assessments[0].jpg_path is None
     assert assessments[0].rating is not None
     assert assessments[0].sharpness is not None
+
+
+def test_singleton_frames_are_not_burst_winners(tmp_path):
+    # Two lone frames, 10 s apart -> two singleton bursts, no burst bonus.
+    _write_pair(tmp_path, "A", "2024:01:01 12:00:00", "000000")
+    _write_pair(tmp_path, "B", "2024:01:01 12:05:00", "000000")
+
+    config = load_config(tmp_path / "missing.toml")
+    assessments = analyze_directory(
+        str(tmp_path), config, AnalysisOptions(max_dim=256, workers=1),
+        threshold_seconds=2.0,
+    )
+    assert len(assessments) == 2
+    assert all(a.is_burst_winner is False for a in assessments)

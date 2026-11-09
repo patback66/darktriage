@@ -149,13 +149,13 @@ For each `.NEF`/`.JPG` pair, `analyze` runs this pipeline:
 2. If **ISO > `sensor.iso_blur_above`** (default 1600), apply a 3×3 Gaussian noise pre-filter.
 3. Compute **Tenengrad** (Sobel `Gx²+Gy²`) on the central `sensor.region_center_fraction` region (default 60%). If it is below `thresholds.tenengrad_blur`, the frame is flagged **soft/blur and exits early** (no composition/clipping work).
 4. Otherwise compute **composition** (off-centre ÷ centre grid energy) and **exposure** (mean luminance + clipped-highlight %), and derive a recommended **EV offset** `clamp(log2(128/mean), -2, +2)`.
-5. **Burst grouping**: shots within `thresholds.burst_interval_sec` are clustered; the sharpest frame in each burst is the **winner** and gets +1 star.
+5. **Burst grouping**: shots within `thresholds.burst_interval_sec` are clustered; for each **multi-frame** burst the sharpest frame is the **winner** and gets +1 star (lone frames are not "winners").
 
 Ratings and labels are then derived from the configured thresholds:
 
 | Condition | Rating | Label |
 | --- | --- | --- |
-| Burst winner **and** `sharpness ≥ tenengrad_sharp` **and** `composition ≥ composition_min` | 5 | purple (portfolio) |
+| Multi-frame burst winner **and** `sharpness ≥ tenengrad_sharp` **and** `composition ≥ composition_min` | 5 | purple (portfolio) |
 | `sharpness ≥ tenengrad_sharp` (crisp keeper) | 4 | green |
 | In between (average) | 3 | — |
 | `sharpness ≤ tenengrad_blur` (soft) | 1 | red |
