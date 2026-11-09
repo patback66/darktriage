@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -202,9 +204,33 @@ def discover_pairs(target_dir: Path) -> List[ImagePair]:
         key=lambda p: p.name,
     )
 
+    jpg_for_raw: List[Optional[Path]] = [jpg_by_stem.get(raw.stem) for raw in raw_paths]
+
+    # Read EXIF headers concurrently: each is an independent, I/O-bound small
+    # read, so threads overlap the open latency on external/network volumes.
+    def _read(indexed: Tuple[int, Path]) -> Tuple[int, "ExifSummary"]:
+        index, jpg_path = indexed
+        return index, read_exif_summary(jpg_path)
+
+    summaries: Dict[int, "ExifSummary"] = {}
+    pending = [
+        (index, jpg_path)
+        for index, jpg_path in enumerate(jpg_for_raw)
+        if jpg_path is not None
+    ]
+    if pending:
+        workers = min(16, max(1, (os.cpu_count() or 1) * 2), len(pending))
+        if workers > 1 and len(pending) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for index, summary in pool.map(_read, pending):
+                    summaries[index] = summary
+        else:
+            for index, jpg_path in pending:
+                summaries[index] = read_exif_summary(jpg_path)
+
     pairs: List[ImagePair] = []
-    for raw in raw_paths:
-        jpg = jpg_by_stem.get(raw.stem)
+    for index, raw in enumerate(raw_paths):
+        jpg = jpg_for_raw[index]
         if jpg is None:
             logger.warning(
                 "No matching JPEG preview for %s (skipped for scoring)", raw
@@ -212,9 +238,9 @@ def discover_pairs(target_dir: Path) -> List[ImagePair]:
             pairs.append(ImagePair(raw_path=raw, jpg_path=None))
             continue
 
-        # One EXIF open per file: capture time, ISO and orientation are read
-        # together and cached on the pair so the engine never re-opens it.
-        summary = read_exif_summary(jpg)
+        # Capture time, ISO and orientation are cached on the pair so the
+        # engine never re-opens the file.
+        summary = summaries[index]
         pairs.append(
             ImagePair(
                 raw_path=raw,

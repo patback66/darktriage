@@ -120,3 +120,16 @@ def test_discover_pairs_ignores_macos_appledouble(tmp_path):
     assert pairs[0].raw_path.name == "A.NEF"
     assert pairs[0].jpg_path == tmp_path / "A.JPG"
     assert not any(p.raw_path.name.startswith(".") for p in pairs)
+
+
+def test_discover_pairs_parallel_many(tmp_path):
+    for i in range(12):
+        _jpeg_with_exif(tmp_path / f"{i:02d}.JPG", dt="2024:01:01 12:00:00")
+        (tmp_path / f"{i:02d}.NEF").write_bytes(b"RAW")
+
+    pairs = discover_pairs(tmp_path)
+    assert len(pairs) == 12
+    assert [p.raw_path.name for p in pairs] == sorted(
+        p.raw_path.name for p in pairs
+    )
+    assert all(p.metadata_loaded and p.capture_time is not None for p in pairs)

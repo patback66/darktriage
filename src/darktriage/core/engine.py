@@ -249,9 +249,12 @@ def analyze_directory(
     def sharpness_of(pair: ImagePair) -> float:
         return score_by_path.get(pair.raw_path, zero).sharpness
 
-    # Winners keyed by raw path so two raws sharing one preview are distinct.
+    # Winners are only meaningful for real bursts (>= 2 frames).  A lone frame
+    # is not a "burst winner" (otherwise every singleton gets the +1 star).
     winner_raw: Set[Path] = set()
     for group in groups:
+        if len(group.images) < 2:
+            continue
         best = max(group.images, key=sharpness_of, default=None)
         if best is not None:
             winner_raw.add(best.raw_path)
