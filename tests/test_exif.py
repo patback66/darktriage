@@ -102,3 +102,21 @@ def test_select_burst_winners_picks_highest_sharpness():
 
 def test_default_burst_threshold_is_two_seconds():
     assert DEFAULT_BURST_SECONDS == 2.0
+
+def test_discover_pairs_ignores_macos_appledouble(tmp_path):
+    image = Image.new("RGB", (8, 8), "gray")
+    exif = Image.Exif()
+    exif[0x9003] = "2024:01:01 12:00:00"
+    image.save(tmp_path / "A.JPG", exif=exif)
+    (tmp_path / "A.NEF").write_bytes(b"RAW")
+
+    # macOS/network-volume junk that shares the real extensions.
+    (tmp_path / "._A.JPG").write_bytes(b"\x00\x05\x16\x07junk")
+    (tmp_path / "._A.NEF").write_bytes(b"\x00\x05\x16\x07junk")
+    (tmp_path / ".DS_Store").write_bytes(b"junk")
+
+    pairs = discover_pairs(tmp_path)
+    assert len(pairs) == 1
+    assert pairs[0].raw_path.name == "A.NEF"
+    assert pairs[0].jpg_path == tmp_path / "A.JPG"
+    assert not any(p.raw_path.name.startswith(".") for p in pairs)

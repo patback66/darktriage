@@ -332,16 +332,31 @@ def bench_engine(directory: Path, max_dim: int, workers: int) -> EngineStats:
     )
 
 
-def discover_jpegs(directory: Path) -> List[Path]:
-    """Return JPEG preview files in a real folder, sorted by filename."""
-    return sorted(
-        (
-            path
-            for path in directory.iterdir()
-            if path.is_file() and path.suffix.lower() in JPG_SUFFIXES
-        ),
-        key=lambda path: path.name,
-    )
+def discover_jpegs(directory: Path, limit: Optional[int] = None) -> List[Path]:
+    """Return real, decodable JPEG previews in a folder, sorted by name.
+
+    Skips macOS AppleDouble/resource-fork files (``._NAME``), hidden files, and
+    any file whose header Pillow cannot identify, so a stray sidecar cannot
+    abort the benchmark.  ``limit`` stops scanning once enough valid previews
+    have been collected.
+    """
+    found: List[Path] = []
+    for path in sorted(directory.iterdir(), key=lambda p: p.name):
+        if limit is not None and len(found) >= limit:
+            break
+        if not path.is_file():
+            continue
+        if path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in JPG_SUFFIXES:
+            continue
+        try:
+            with Image.open(path) as image:
+                image.size  # header-only validation; raises if not a real image
+        except Exception:  # noqa: BLE001 - skip unreadable/corrupt files
+            continue
+        found.append(path)
+    return found
 
 
 def bench_parallel_scoring(
@@ -544,7 +559,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.dir is not None:
             banner("DarkTriage throughput benchmark (real folder)")
-            jpg_paths = discover_jpegs(args.dir)[: args.images]
+            jpg_paths = discover_jpegs(args.dir, limit=args.images)
             if not jpg_paths:
                 print(f"  no JPEG previews (.jpg/.jpeg) found in {args.dir}")
                 return 2

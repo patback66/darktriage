@@ -113,6 +113,16 @@ def read_capture_time(jpg_path: Path) -> Optional[datetime]:
     return decode_capture_time(dt, subsec)
 
 
+def _is_macos_metadata(path: Path) -> bool:
+    """True for hidden/AppleDouble files (``._NAME``, ``.DS_Store``, ...).
+
+    These resource-fork sidecars appear on macOS/exFAT/network volumes and are
+    not real images, but they often share the ``.JPG``/``.NEF`` extension.
+    """
+    name = path.name
+    return name.startswith(".") or name.startswith("._")
+
+
 def discover_pairs(target_dir: Path) -> List[ImagePair]:
     """Match .NEF/.RAW files with same-stem JPEG previews in a directory."""
     directory = Path(target_dir)
@@ -121,14 +131,20 @@ def discover_pairs(target_dir: Path) -> List[ImagePair]:
 
     jpg_by_stem: Dict[str, Path] = {}
     for path in directory.iterdir():
-        if path.is_file() and path.suffix.lower() in JPG_EXTENSIONS:
+        if (
+            path.is_file()
+            and path.suffix.lower() in JPG_EXTENSIONS
+            and not _is_macos_metadata(path)
+        ):
             jpg_by_stem.setdefault(path.stem, path)
 
     raw_paths = sorted(
         (
             p
             for p in directory.iterdir()
-            if p.is_file() and p.suffix.lower() in RAW_EXTENSIONS
+            if p.is_file()
+            and p.suffix.lower() in RAW_EXTENSIONS
+            and not _is_macos_metadata(p)
         ),
         key=lambda p: p.name,
     )
