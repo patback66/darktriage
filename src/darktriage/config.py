@@ -45,6 +45,10 @@ exposure_warn = "yellow"
 [darktable]
 cli_path = "darktable-cli"
 config_dir = "~/.config/darktable"
+
+[sensor]
+iso_blur_above = 1600
+region_center_fraction = 0.6
 """
 
 
@@ -134,6 +138,7 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Config:
     thresholds_raw = _section(data, "thresholds")
     tags_raw = _section(data, "tags")
     darktable_raw = _section(data, "darktable")
+    sensor_raw = _section(data, "sensor")
 
     safety = Safety(
         preserve_existing=_value(safety_raw, "preserve_existing", True),
@@ -157,11 +162,16 @@ def load_config(path: Optional[Union[str, Path]] = None) -> Config:
         cli_path=_value(darktable_raw, "cli_path", "darktable-cli"),
         config_dir=_value(darktable_raw, "config_dir", "~/.config/darktable"),
     )
+    sensor = Sensor(
+        iso_blur_above=_value(sensor_raw, "iso_blur_above", 1600),
+        region_center_fraction=_value(sensor_raw, "region_center_fraction", 0.6),
+    )
     return Config(
         safety=safety,
         thresholds=thresholds,
         tags=tags,
         darktable=darktable,
+        sensor=sensor,
         config_path=config_path,
     )
 
